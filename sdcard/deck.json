@@ -1,0 +1,360 @@
+{
+  "rev": 7,
+  "themes": [
+    {
+      "name": "Midnight",
+      "bg": "#0d1117",
+      "tile": "#1b2129",
+      "tile_grad": "#141a21",
+      "border": "#8fa6c0",
+      "border_opa": 22,
+      "radius": 14,
+      "accent": "#4aa3ff",
+      "text": "#e6edf3",
+      "text_muted": "#8b949e",
+      "ok": "#3fb950",
+      "idle": "#6e7681"
+    },
+    {
+      "name": "Stars",
+      "wallpaper": "/wall/stars.bin",
+      "bg": "#060a12",
+      "tile": "#0a1424",
+      "tile_grad": "#060d18",
+      "tile_opa": 58,
+      "border": "#9fd8ff",
+      "border_opa": 26,
+      "radius": 16,
+      "accent": "#4fd6ff",
+      "text": "#ffffff",
+      "text_muted": "#a8c4d8",
+      "ok": "#5ce08a",
+      "idle": "#6b7d92"
+    },
+    {
+      "name": "Wavy",
+      "wallpaper": "/wall/wavy.bin",
+      "bg": "#050a1c",
+      "tile": "#08102a",
+      "tile_grad": "#050a1c",
+      "tile_opa": 70,
+      "border": "#cfe0ff",
+      "border_opa": 22,
+      "radius": 16,
+      "accent": "#7aa8ff",
+      "text": "#ffffff",
+      "text_muted": "#b3c2e0",
+      "ok": "#5ce08a",
+      "idle": "#6f7d99"
+    },
+    {
+      "name": "Verdant",
+      "wallpaper": "/wall/verdant.bin",
+      "bg": "#0b1207",
+      "tile": "#0d1608",
+      "tile_grad": "#081005",
+      "tile_opa": 62,
+      "border": "#e8ffc9",
+      "border_opa": 24,
+      "radius": 16,
+      "accent": "#ffc247",
+      "text": "#ffffff",
+      "text_muted": "#b9cba4",
+      "ok": "#8fe05c",
+      "idle": "#7d8a6f"
+    },
+    {
+      "name": "Paper",
+      "bg": "#e8e4dc",
+      "tile": "#ffffff",
+      "tile_grad": "#f2efe9",
+      "border": "#5a5a52",
+      "border_opa": 30,
+      "radius": 12,
+      "accent": "#2f6f4f",
+      "text": "#22201c",
+      "text_muted": "#6b675e",
+      "ok": "#2f6f4f",
+      "idle": "#a8a49c"
+    }
+  ],
+  "settings": {
+    "brightness": 80,
+    "idle_dim_s": 60,
+    "idle_off_s": 300,
+    "theme": "Stars"
+  },
+  "pages": [
+    {
+      "id": "launch",
+      "title": "Launch",
+      "type": "grid",
+      "grid": {
+        "cols": 4,
+        "rows": 3
+      },
+      "buttons": [
+        {
+          "id": "launch.vscode",
+          "label": "VS Code",
+          "action": {
+            "type": "launch",
+            "target": "code"
+          }
+        },
+        {
+          "id": "launch.terminal",
+          "label": "Terminal",
+          "action": {
+            "type": "launch",
+            "target": "wt.exe"
+          }
+        },
+        {
+          "id": "launch.explorer",
+          "label": "Explorer",
+          "action": {
+            "type": "launch",
+            "target": "explorer.exe"
+          }
+        },
+        {
+          "id": "launch.browser",
+          "label": "Browser",
+          "action": {
+            "type": "launch",
+            "target": "https://github.com"
+          }
+        },
+        {
+          "id": "launch.notepad",
+          "label": "Notepad",
+          "action": {
+            "type": "launch",
+            "target": "notepad.exe"
+          }
+        },
+        {
+          "id": "launch.calc",
+          "label": "Calc",
+          "action": {
+            "type": "launch",
+            "target": "calc.exe"
+          }
+        },
+        {
+          "id": "win.snap_left",
+          "label": "Snap L",
+          "action": {
+            "type": "ahk",
+            "fn": "SnapLeft"
+          }
+        },
+        {
+          "id": "win.snap_right",
+          "label": "Snap R",
+          "action": {
+            "type": "ahk",
+            "fn": "SnapRight"
+          }
+        },
+        {
+          "id": "sys.lock",
+          "label": "Lock",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "GUI",
+              "l"
+            ]
+          }
+        },
+        {
+          "id": "sys.taskmgr",
+          "label": "Task Mgr",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "SHIFT",
+              "ESC"
+            ]
+          }
+        },
+        {
+          "id": "sys.desktop",
+          "label": "Desktop",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "GUI",
+              "d"
+            ]
+          }
+        },
+        {
+          "id": "nav.macros",
+          "label": "Macros >",
+          "action": {
+            "type": "page",
+            "target": "macros"
+          }
+        }
+      ]
+    },
+    {
+      "id": "macros",
+      "title": "Macros",
+      "type": "grid",
+      "grid": {
+        "cols": 4,
+        "rows": 3
+      },
+      "buttons": [
+        {
+          "id": "edit.copy",
+          "label": "Copy",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "c"
+            ]
+          }
+        },
+        {
+          "id": "edit.paste",
+          "label": "Paste",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "v"
+            ]
+          }
+        },
+        {
+          "id": "edit.paste_plain",
+          "label": "Paste Raw",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "SHIFT",
+              "v"
+            ]
+          }
+        },
+        {
+          "id": "edit.undo",
+          "label": "Undo",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "z"
+            ]
+          }
+        },
+        {
+          "id": "media.prev",
+          "label": "Prev",
+          "action": {
+            "type": "media",
+            "key": "prev"
+          }
+        },
+        {
+          "id": "media.play",
+          "label": "Play",
+          "action": {
+            "type": "media",
+            "key": "play_pause"
+          }
+        },
+        {
+          "id": "media.next",
+          "label": "Next",
+          "action": {
+            "type": "media",
+            "key": "next"
+          }
+        },
+        {
+          "id": "media.mute",
+          "label": "Mute",
+          "action": {
+            "type": "media",
+            "key": "mute"
+          }
+        },
+        {
+          "id": "macro.email",
+          "label": "Email",
+          "action": {
+            "type": "hid_text",
+            "text": "you@example.com"
+          }
+        },
+        {
+          "id": "macro.standup",
+          "label": "Standup",
+          "action": {
+            "type": "seq",
+            "steps": [
+              {
+                "type": "launch",
+                "target": "https://meet.google.com"
+              },
+              {
+                "type": "delay",
+                "ms": 2500
+              },
+              {
+                "type": "hid",
+                "keys": [
+                  "CTRL",
+                  "d"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "sys.screenshot",
+          "label": "Snip",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "GUI",
+              "SHIFT",
+              "s"
+            ]
+          }
+        },
+        {
+          "id": "ui.theme",
+          "label": "Theme >",
+          "action": {
+            "type": "theme",
+            "target": "next"
+          },
+          "hold": {
+            "type": "theme",
+            "target": "Midnight"
+          }
+        }
+      ]
+    },
+    {
+      "id": "numpad",
+      "title": "Ten-Key",
+      "type": "numpad"
+    },
+    {
+      "id": "stats",
+      "title": "System",
+      "type": "stats"
+    }
+  ]
+}

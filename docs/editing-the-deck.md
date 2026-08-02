@@ -1,0 +1,260 @@
+# Editing the deck layout
+
+Everything the deck shows — pages, tiles, labels, actions, colours, brightness — comes from a
+single file. No reflashing, no recompiling.
+
+## Where the file lives
+
+There are two copies, and it matters which you edit.
+
+| Copy | Role |
+|---|---|
+| **`sdcard/deck.json`** in this repo | **The master. Edit this one.** The PC agent reads it |
+| `/deck.json` on the device's SD card | A cache. The device overwrites it whenever the agent pushes |
+
+The device only reads its SD copy **at boot**, and only to have something to show before the
+agent connects. The agent is authoritative: whenever the two disagree, the agent's copy wins and
+gets written to the card.
+
+## Getting a change onto the deck
+
+### The quick way — tray reload
+
+1. Edit `sdcard/deck.json`, save.
+2. Right-click the tray icon → **Reload deck.json**.
+
+The agent re-reads the file, validates it, pushes it over USB, and the deck rebuilds its screen
+immediately. The device also writes the new copy to its SD card, so it survives a power cycle.
+
+**No `rev` bump needed for this path.** A reload always pushes.
+
+If the file has an error, the agent logs it, shows `deck.json has errors` on the deck, and **keeps
+the layout that is currently running** — a typo cannot leave you with a blank screen.
+
+### The other way — bump `rev`
+
+The agent re-reads `deck.json` from disk whenever a session starts: at launch, and on every
+reconnect. So an edit made while the deck was unplugged — or, far more often, while it was being
+reflashed — is already in hand by the time the device comes back.
+
+What it does *not* do is push unprompted. On connect it compares its `rev` against the device's
+and only pushes if they differ. Edit the file without changing `rev` and the two still claim to be
+the same revision, so nothing moves.
+
+```jsonc
+{
+  "rev": 4,        // <-- increment this when you are not using tray reload
+  ...
+}
+```
+
+**Reflashing the firmware never changes the layout.** Pages, tiles and themes are data the agent
+owns; the device only knows how to render them. A new page type in firmware still needs a page in
+`deck.json` before it appears — bump `rev`, or just hit tray reload.
+
+Tray reload is easier and always pushes. `rev` exists so a device that boots with a stale SD card
+catches up on its own.
+
+### The blunt way — copy the file
+
+Pull the card, copy `sdcard/deck.json` to its root, put it back. Only needed if you want the deck
+to show something specific before the agent ever connects.
+
+## Themes
+
+`deck.json` carries a list of themes. One is active; a tile can step through them.
+
+```jsonc
+"themes": [
+  {
+    "name":       "Midnight",   // how you refer to it; shown as a toast when it is selected
+    "wallpaper":  "",           // path to an image on the SD card, e.g. "/wall/dusk.bin"
+
+    "bg":         "#0d1117",    // the backdrop, behind everything
+    "tile":       "#1b2129",    // button face
+    "tile_grad":  "#141a21",    // second gradient stop; omit for a flat fill
+    "tile_opa":   100,          // 0-100 fill opacity — below 100 lets the wallpaper through
+    "border":     "#8fa6c0",    // hairline around tiles
+    "border_opa": 22,           // 0-100; 0 removes the border entirely
+    "radius":     14,           // corner radius in px
+
+    "accent":     "#4aa3ff",    // pressed tiles, active nav tab, gauge arcs, chart line
+    "text":       "#e6edf3",    // labels
+    "text_muted": "#8b949e",    // stats captions, the detail line, disabled tile labels
+    "ok":         "#3fb950",    // status dot, agent connected
+    "idle":       "#6e7681",    // status dot, agent absent
+
+    "flip180":    true          // mount the deck the other way up
+  }
+],
+"settings": {
+  "theme":      "Midnight",     // which one to start on; omit for the first
+  "brightness": 80,             // 0-100, applied on reload
+  "idle_dim_s": 60,             // dim the backlight after this many idle seconds
+  "idle_off_s": 300
+}
+```
+
+**Every field is optional.** An absent one keeps its default rather than being coerced — including
+`"bg": "#000000"`, which is a real black and not a parse failure. Colours are six-digit hex, `#`
+optional; anything else is rejected and the default kept.
+
+Edit, save, tray reload — the whole screen restyles in place. Nothing needs a reflash.
+
+The old single-object form still works:
+
+```jsonc
+"theme": { "bg": "#101418", "tile": "#1b2129", "accent": "#4aa3ff", "text": "#e6edf3" }
+```
+
+It is read as a one-theme list. There is no migration step.
+
+### Wallpapers
+
+A theme can put a photograph behind the tiles. Images live on the SD card, so unlike colours
+they do not hot-reload — the card has to be written.
+
+**1. Convert.** The deck reads raw RGB565, not PNG or JPEG, so there is no decode step on the
+device:
+
+```powershell
+python tools/make_assets.py wallpaper "C:\photos\dusk.jpg" --out sdcard/wall/dusk.bin --dim 35
+python tools/make_assets.py wallpaper "C:\photos\*.jpg" --out-dir sdcard/wall
+```
+
+| Flag | What it does |
+|---|---|
+| `--dim 0-100` | Darkens the image, baked in. 25–40 usually keeps tile labels readable |
+| `--anchor top\|centre\|bottom` | Which part of a too-tall photo survives the crop |
+| `--blur N` | Gaussian blur radius, for a calmer backdrop under busy tiles |
+| `--width` / `--height` | Defaults to 800×480 |
+
+Images are **cropped to fill**, never letterboxed — black bars read as a fault rather than a
+choice. A portrait photo keeps its middle band unless `--anchor` says otherwise.
+
+Each wallpaper is 750 KB, which is nothing against a 32 GB card or 8 MB of PSRAM.
+
+**2. Copy `sdcard/` to the card.** The device reads images from the card directly; the agent
+never sends them.
+
+**3. Point a theme at it and turn the tiles translucent:**
+
+```jsonc
+{
+  "name": "Dusk",
+  "wallpaper": "/wall/dusk.bin",
+  "tile": "#0e141b",
+  "tile_opa": 68,          // <-- the photo reads through here
+  "border": "#ffffff",
+  "border_opa": 24,
+  "radius": 16,
+  "text": "#ffffff"
+}
+```
+
+`tile_opa` is the whole effect. At 100 the tiles are solid and the wallpaper only shows in the
+gutters; around 60–75 gives the glass look with labels still legible. Below about 45 the text
+starts fighting the photo.
+
+If the file is missing or malformed the theme falls back to its flat `bg` and says so on the
+port-A log — a bad path costs you the photo, never the screen.
+
+### Switching themes
+
+```jsonc
+{ "id": "ui.theme", "label": "Theme >",
+  "action": { "type": "theme", "target": "next" },      // or "prev", or a theme name
+  "hold":   { "type": "theme", "target": "Midnight" } }
+```
+
+This runs **on the device**, so it works with the agent closed — same as the ten-key. The choice is
+written to `/theme.txt` on the SD card and restored at boot. Editing the layout does not reset it:
+if the theme you were on still exists by name, you stay on it.
+
+### The Colours page
+
+```jsonc
+{ "id": "colors", "title": "Colours", "type": "colortest" }
+```
+
+A bench diagnostic, built in firmware. It exists because judging a theme by switching to it asks
+you to hold a colour in memory between screens, and human vision is poor at that — it is good at
+*simultaneous* comparison. So this page puts everything side by side:
+
+| Row | Question it answers |
+|---|---|
+| Greyscale ramp, `#00` to `#FF`, weighted dark | Where is this panel's black floor? If the first few patches are indistinguishable, nothing below that level can separate itself, and dark themes will always look alike |
+| Eight hues at level `0x30` | Does hue survive at the luminance a dark theme actually lives at? |
+| Every theme's `bg` / `tile` / `accent` / `text`, one row each | Are two themes genuinely different, or do they only look the same? |
+| The resolved values as text | What the firmware actually parsed — not what the file says |
+
+That last row matters most in practice: `tile` covers about 87% of a 4×3 page, so two themes with
+similar tiles read as "identical" even when their accents are nothing alike.
+
+### What the device tells you
+
+Every load and every theme switch prints the resolved theme to the debug log — **port A / the
+CH343P COM port, in the Arduino IDE Serial Monitor**. This is `MD_LOG` (UART0) and is a different
+pipe from the agent's `deckhost.log`, which only ever sees what crosses port B:
+
+```
+[theme] "Midnight" bg=#0D1117 tile=#1B2129 grad=#141A21 opa=100 border=#8FA6C0/22 radius=14
+[theme]   accent=#4AA3FF text=#E6EDF3 muted=#8B949E ok=#3FB950 idle=#6E7681 flip180=1 ...
+```
+
+These are the values *after* parsing and defaulting, so "did my edit land, and as what?" is a
+question you answer by looking rather than by inferring from the panel.
+
+### Notes from building it
+
+- **`accent` does a lot of work.** Pressed state, active nav tab, stats arcs and the chart line. A
+  colour that reads well as a large pressed tile can be too strong as a 14px dot — that is what
+  `ok` and `idle` are for, so the dot no longer borrows it.
+- **Contrast against `tile`, not against `bg`.** Labels sit on tiles.
+- **A disabled tile no longer fades the whole button.** It keeps its fill and moves the label to
+  `text_muted`, so make sure `text_muted` is legible on `tile` — otherwise closing the agent makes
+  half the deck unreadable rather than merely dimmed.
+- **`brightness` interacts with idle dimming.** After `idle_dim_s` the backlight drops to 10%
+  regardless, so wake the screen before judging a brightness change.
+- **Judge a colour against a neutral background.** A grey patch surrounded by blue reads as
+  yellow-olive — ordinary simultaneous contrast, and a good way to chase a bug that is not there.
+  The Colours page exists for this; switch to Paper before trusting what you see on a dark theme.
+- **If dark colours look wrong, suspect the firmware before the panel.** Up to 0.4.2 a GPIO
+  collision pinned blue's top bit high, so black rendered as mid-blue and no dark theme could
+  hold its temperature. That is fixed, but the lesson stands — see
+  [hardware-notes.md](hardware-notes.md).
+
+## What a reload does and does not touch
+
+| Reloads live | Needs a reflash |
+|---|---|
+| Pages, tiles, labels, positions | Font sizes (compiled in, see `theme.cpp`) |
+| Actions and macros | The numpad layout (fixed in firmware) |
+| Theme colours, opacity, radius, borders | Stats page layout |
+| Which theme is active | Anything in `config.h` |
+| 180° flip | |
+| Brightness, idle timeouts | |
+
+The split is deliberate: data lives in `deck.json`, structure lives in firmware. The ten-key is not
+expressible as a JSON grid — its tall `+` and `Enter` keys need spans a plain grid does not
+describe — so it is built in code.
+
+## Validation
+
+The agent checks the file before pushing and rejects it on:
+
+- a button with no `id`
+- duplicate `id`s
+- an action with no `type`
+- a `page` action pointing at a page that does not exist
+- a `theme` action naming a theme that does not exist
+- `settings.theme` naming a theme that does not exist
+
+The last three are the valuable checks. Without them a typo'd target produces a button that looks
+perfectly normal and silently does nothing.
+
+Validate without touching the deck:
+
+```powershell
+python -c "import sys; sys.path.insert(0,'agent'); from deckhost.config import DeckConfig; c=DeckConfig.load(); print('OK', c.rev, len(c.buttons), 'buttons')"
+```

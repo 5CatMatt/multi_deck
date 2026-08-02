@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deckhost"
+version = "0.1.0"
+description = "PC agent for the multi_deck touchscreen deck companion"
+requires-python = ">=3.10"
+
+# Deliberately minimal. The agent runs with no dependencies at all in --simulate mode, which
+# keeps the action dispatch and stats pipeline testable on any machine. Everything below is
+# needed only to talk to real hardware.
+dependencies = [
+    "pyserial>=3.5",
+    "psutil>=5.9",
+    # Needed by the autostart/tray workflow, which is the normal way to run this.
+    "pystray>=0.19",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+# Each of these degrades gracefully rather than failing, so they stay optional.
+gpu = ["pynvml>=11.5"]
+ahk = ["ahk>=1.0"]
+all = ["pynvml>=11.5", "ahk>=1.0"]
+
+[project.scripts]
+deckhost = "deckhost.main:main"
+
+[tool.setuptools]
+packages = ["deckhost"]

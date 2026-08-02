@@ -1,0 +1,11 @@
+# The agent runs with no dependencies at all in --simulate mode, which is deliberate: the
+# action dispatch and stats pipeline stay testable on any machine.
+
+pyserial>=3.5        # USB CDC link to the deck
+psutil>=5.9          # CPU / memory / disk / network stats
+pystray>=0.19        # tray icon
+pillow>=10.0         # tray icon rendering, and tools/make_icons.py
+
+# Optional. Each degrades to "field absent" rather than failing.
+pynvml>=11.5         # NVIDIA GPU utilisation and temperature
+ahk>=1.0             # persistent AutoHotkey backend; also needs AutoHotkey v2 installed
