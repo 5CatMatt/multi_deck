@@ -146,6 +146,7 @@ bool Link::sendHello() {
   doc["fw"] = MD_FW_VERSION;
   doc["dev"] = MD_DEVICE_NAME;
   doc["rev"] = device_rev_;
+  if (have_asset_stamp_) doc["assets"] = asset_stamp_;
   return sendFrame(doc);
 }
 

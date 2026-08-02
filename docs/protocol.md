@@ -55,7 +55,7 @@ deliberately rather than only encountering it by accident.
 
 | Frame | Fields | Meaning |
 |---|---|---|
-| `hello` | `proto`, `fw`, `dev`, `rev` | Session open. `rev` is the layout revision the device currently holds |
+| `hello` | `proto`, `fw`, `dev`, `rev`, `assets` | Session open. `rev` is the layout revision the device currently holds; `assets` is the card's asset stamp — see below |
 | `press` | `id`, `page` | A tile needing the agent was pressed |
 | `release` | `id`, `page`, `held_ms` | Release, for hold-to-repeat and long-press actions |
 | `pong` | `seq` | Reply to `ping` |
@@ -65,6 +65,28 @@ deliberately rather than only encountering it by accident.
 
 Device-local presses (`hid`, `hid_text`, `media`, `page`, `theme`) do **not** emit `press`. They are executed
 on-device and never touch the wire. Only `log` may mention them.
+
+### The `assets` field — telling a stale SD card from a current one
+
+Layout and colours cannot go stale: they are pushed whenever `rev` disagrees. Images can, because
+they only reach the card by hand. A wallpaper regenerated and never copied still *exists* on the
+card, so it loads, and nothing anywhere reports that the picture on screen is not the one you made.
+
+`assets` closes that. `tools/make_assets.py` writes a content hash of `sdcard/` to
+`sdcard/assets.ver`; copying the tree carries it along, so the card declares its own generation.
+The device reads the file and repeats it here — **it hashes nothing and compares nothing.** The
+agent has the originals, so the agent decides.
+
+Three states, deliberately distinct:
+
+| `assets` | Means | Agent does |
+|---|---|---|
+| absent | No card mounted, or firmware older than the stamp | nothing — neither is evidence, and a cardless deck already says so on screen |
+| `""` | Card mounted, no `assets.ver` on it | asks for a copy, without claiming the images are wrong |
+| a hash | The card's generation | compares; warns and toasts only on a genuine mismatch |
+
+A content hash rather than a number you bump: a version you have to remember to increment is only
+correct while you remember, and this exists for the times you forgot.
 
 ## Frames: host → device
 

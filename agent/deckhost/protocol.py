@@ -113,8 +113,16 @@ def stats(sample: dict[str, Any]) -> dict[str, Any]:
 # --- device -> host (constructed by the simulator and the tests) ----------------------
 
 
-def hello(fw: str = "0.0.0", rev: int = 0) -> dict[str, Any]:
-    return {"t": "hello", "proto": PROTO_VERSION, "fw": fw, "dev": "multi_deck", "rev": rev}
+def hello(fw: str = "0.0.0", rev: int = 0, assets: str | None = None) -> dict[str, Any]:
+    """`assets` omitted entirely means "no card mounted", matching Link::sendHello().
+
+    An empty string is a different answer — a mounted card that carries no stamp — so None
+    and "" must not collapse into each other here either.
+    """
+    frame = {"t": "hello", "proto": PROTO_VERSION, "fw": fw, "dev": "multi_deck", "rev": rev}
+    if assets is not None:
+        frame["assets"] = assets
+    return frame
 
 
 def press(button_id: str, page: str = "") -> dict[str, Any]:

@@ -28,4 +28,11 @@ size_t bytesHeld();
 // different fixes, so "it did not work" is not a useful thing to put on screen.
 const String &lastError();
 
+// The card's asset generation, read from /assets.ver, or "" if the card carries no stamp.
+//
+// Purely a value to carry: the device hashes nothing and compares nothing. It repeats this in
+// `hello` and the agent, which has the originals, decides whether the card is current. Read
+// once — the card is not swapped while running.
+const String &stamp();
+
 }  // namespace assets

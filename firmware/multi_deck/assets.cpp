@@ -29,6 +29,9 @@ std::vector<Entry *> g_cache;
 size_t g_bytes = 0;
 String g_error;
 
+String g_stamp;
+bool g_stamp_read = false;
+
 bool fail(const String &reason) {
   g_error = reason;
   MD_LOG.printf("[assets] %s\n", reason.c_str());
@@ -154,5 +157,31 @@ void clear() {
 size_t bytesHeld() { return g_bytes; }
 
 const String &lastError() { return g_error; }
+
+const String &stamp() {
+  if (g_stamp_read) return g_stamp;
+  g_stamp_read = true;
+
+  // Every path below leaves g_stamp empty, which the agent reads as "this card declares no
+  // generation" — never as a mismatch. A missing stamp is normal on a card written before
+  // tools/make_assets.py started emitting one.
+  if (!board_port::sdMounted()) return g_stamp;
+
+  File file = SD.open(MD_ASSET_STAMP_PATH, FILE_READ);
+  if (!file) return g_stamp;
+
+  String line = file.readStringUntil('\n');
+  file.close();
+  line.trim();
+
+  if (line.length() > MD_ASSET_STAMP_MAX) {
+    MD_LOG.printf("[assets] %s is not a stamp (%u bytes) — ignoring\n", MD_ASSET_STAMP_PATH,
+                  static_cast<unsigned>(line.length()));
+    return g_stamp;
+  }
+
+  g_stamp = line;
+  return g_stamp;
+}
 
 }  // namespace assets

@@ -28,6 +28,85 @@ The device resolves `hid`, `media` and `page` actions **by itself**. The numpad 
 working with the PC agent closed — they are real HID keycodes, so they also reach elevated windows,
 games and the BIOS. Everything else is forwarded to the agent as an event.
 
+## Using the deck
+
+### The nav bar
+
+A 56 px strip across the top, one tab per page, with a **status dot** at the right end:
+
+| Dot | Meaning |
+|---|---|
+| Green | The PC agent is connected. Everything works. |
+| Grey | No agent — it is closed, the cable is out, or the PC is asleep. |
+
+Grey is not a fault. The deck is designed to be useful on its own; see *Working without the PC*
+below.
+
+### Tap and hold
+
+**Tap** runs the tile's action. **Hold** — about 0.4 s — runs its second action, if it has one.
+Not every tile does; the theme switcher is the shipped example, where tap cycles to the next
+theme and hold jumps straight back to a named one.
+
+On the ten-key, holding a digit **repeats** it, the way a real keyboard does.
+
+### The pages
+
+Three kinds, set by `"type"` in the layout:
+
+- **Grid** — the general case. Rows and columns of tiles, each running one action or a sequence
+  of them: launch an app, fire a keyboard shortcut, run an AutoHotkey helper, type a block of
+  text, switch pages, or any chain of those.
+- **Ten-key** — a full numeric keypad. These are **real HID keycodes**, not synthesised input, so
+  they reach elevated windows, games and even the BIOS — places software-generated keystrokes
+  cannot go. This is the one page that works with nothing installed on the PC at all.
+- **Stats** — CPU, memory and GPU gauges with a 60-second CPU history, plus temperatures, memory
+  used and network throughput. Updates once a second while the page is open, and only while it is
+  open.
+
+### Working without the PC
+
+When the agent is not running, tiles that need it **dim but stay visible**, and tapping one says
+so rather than doing nothing. Everything the device can do alone keeps working:
+
+| Works standalone | Needs the agent |
+|---|---|
+| Ten-key, media keys, any keyboard shortcut | Launching apps and URLs |
+| Page navigation, theme switching | AutoHotkey helpers, shell commands |
+| Typing stored text | The stats page |
+
+So the deck is still a numpad and a macro keyboard on a machine that has never seen the agent —
+plug it into a different PC and the HID half just works.
+
+### Themes
+
+Tap the theme tile to cycle; hold to jump to a specific one. The choice is written to the SD card
+and **survives a power cycle**, and editing the layout does not reset it — if the theme you were
+on still exists by name, you stay on it.
+
+Themes carry colours, corner radius, tile translucency, an optional background photo, and whether
+tiles show an icon, a label, or both.
+
+### Screen and messages
+
+The backlight **dims to 10% after 60 seconds** of no touch and comes straight back when you touch
+it. It does not switch off entirely.
+
+Transient messages — layout reloaded, agent not connected, a wallpaper that would not load —
+appear at the bottom of the screen for about 2.5 seconds.
+
+### Changing what is on it
+
+Edit `sdcard/deck.json`, then **Reload deck.json** from the tray icon. The deck rebuilds
+immediately; no reflash, no restart. A layout with an error is rejected and the running one kept,
+so a typo cannot leave you with a blank screen.
+
+Colours, tiles and actions travel over USB and apply instantly. **Images are the exception** —
+wallpapers and icons live on the SD card and have to be copied there. The deck notices when the
+card is out of date and tells you on connect.
+
+Full reference: [docs/editing-the-deck.md](docs/editing-the-deck.md).
+
 ## Layout
 
 | Path | What |
@@ -36,7 +115,11 @@ games and the BIOS. Everything else is forwarded to the agent as an event.
 | `agent/deckhost/` | Python agent that runs on the PC at logon. |
 | `sdcard/` | Version-controlled mirror of what belongs on the SD card. |
 | `tools/` | `make_assets.py` (wallpaper/icon converter), protocol conformance harness. |
-| `docs/` | Wire protocol spec, and hardware facts learned the hard way. |
+| `docs/` | Wire protocol spec, hardware facts learned the hard way, and the backlog. |
+
+**Where the project stopped and what is left** — [docs/beta-complete.md](docs/beta-complete.md).
+Development is paused at firmware `0.5.4` to use the deck and gather UI/UX feedback; that file
+holds the remaining backlog, the rejected ideas and why, and a log to record observations in.
 
 **Changing what the deck shows** — edit `sdcard/deck.json` and hit *Reload deck.json* in the tray.
 See [docs/editing-the-deck.md](docs/editing-the-deck.md).

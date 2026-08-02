@@ -225,6 +225,8 @@ bool DeckConfig::parse(JsonObjectConst root) {
   settings.idle_dim_s = s["idle_dim_s"] | 60;
   settings.idle_off_s = s["idle_off_s"] | 300;
   settings.theme_name = String(s["theme"] | "");
+  settings.display = tileDisplayFromString(s["display"], TileDisplay::IconText);
+  MD_LOG.printf("[config] tile display: %s\n", tileDisplayName(settings.display));
 
   active_theme_ = 0;
   if (!(previous.length() && selectTheme(previous))) {

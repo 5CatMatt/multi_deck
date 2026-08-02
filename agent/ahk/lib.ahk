@@ -34,6 +34,36 @@ FocusWindow(title) {
     }
 }
 
+; Waits for a window to exist, focuses it, and pastes the clipboard into it.
+;
+; This exists to remove the race in "launch an app, then Ctrl+V". A fixed `delay` step cannot
+; win: too short and the paste fires while the previous window still holds focus — so a
+; screenshot lands in whatever you were typing in — and too long makes every use of the tile
+; feel broken. Waiting on the window itself is both faster and correct.
+;
+; `title` is any AHK v2 window spec; "ahk_exe mspaint.exe" is the useful form here. Gives up
+; quietly after `timeout` seconds rather than pasting somewhere unintended.
+;
+; `after` is an optional extra Send, in AHK key syntax, fired once the paste has landed —
+; "^+x" crops Paint to the pasted selection. It belongs in here rather than as a following
+; `hid` step in the sequence, so that it shares the timeout guard above: a trailing step would
+; fire blind into whatever happened to be focused on the run where the window never appeared,
+; which is exactly the case this function exists to make safe.
+PasteInto(title, after := "", timeout := 8) {
+    if !WinWait(title, , Integer(timeout)) {
+        return
+    }
+    WinActivate(title)
+    WinWaitActive(title, , 2)
+    Sleep(120)  ; a freshly-mapped window can accept focus a beat before it accepts input
+    Send("^v")
+
+    if (after != "") {
+        Sleep(120)  ; let the paste settle; a crop needs the selection to exist first
+        Send(after)
+    }
+}
+
 ; Types text without the clipboard, so it survives apps that block paste.
 TypeText(text) {
     SendText(text)

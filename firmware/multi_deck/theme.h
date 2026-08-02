@@ -33,6 +33,7 @@ String takeError();
 
 extern lv_style_t screen;      // background: wallpaper if the theme has one, else flat `bg`
 extern lv_style_t surface;     // content pane; transparent, see note in theme.cpp
+extern lv_style_t panel;       // a card that holds a readout rather than a press target
 extern lv_style_t nav_scrim;   // nav bar: transparent, or a scrim when a wallpaper is set
 extern lv_style_t tile;        // grid and numpad keys
 extern lv_style_t tile_press;  // LV_STATE_PRESSED
@@ -45,13 +46,30 @@ extern lv_style_t toast;
 
 // Fonts. Sized up deliberately for legibility at arm's length; FONT_BASE is applied to the
 // screen so anything that does not override it inherits the larger size.
-extern const lv_font_t *const FONT_BASE;  // nav tabs, toasts, stats text
+extern const lv_font_t *const FONT_BASE;  // nav tabs, toasts
 extern const lv_font_t *const FONT_TILE;  // grid tile labels
 extern const lv_font_t *const FONT_PAD;   // ten-key digits
+
+// Icon glyphs, always Montserrat whatever face the text uses. LV_SYMBOL_* lives in Montserrat's
+// FontAwesome range and no custom face carries it. The fallback chain would cover this, but a
+// tile silently losing its icon is not a thing to leave to an implicit mechanism.
+extern const lv_font_t *const FONT_SYMBOL;     // icon beside a label
+extern const lv_font_t *const FONT_SYMBOL_LG;  // icon-only tile
+
+// The stats page reads as a instrument panel rather than as a list of controls, so it gets its
+// own face — Century Gothic, see fonts.h. Kept separate from the three above because those are
+// also what symbol labels render in, and Century carries no symbol glyphs.
+extern const lv_font_t *const FONT_STAT_VALUE;  // 40px gauge readings
+extern const lv_font_t *const FONT_STAT_LABEL;  // 28px gauge captions
+extern const lv_font_t *const FONT_STAT_TEXT;   // 20px detail line
 
 // Geometry, so the builders stop hard-coding it.
 constexpr int NAV_H = 56;
 constexpr int PAD = 8;
+
+// Interior padding of a `panel`. Lives here because the stats page lays out against a card's
+// content box and would otherwise have to guess it — two numbers that must agree, in two files.
+constexpr int CARD_PAD = PAD + 4;
 
 // Status dot colours, which are theme tokens rather than styles because the dot switches
 // between them at runtime.

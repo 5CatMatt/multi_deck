@@ -4,10 +4,12 @@
 
 #include <vector>
 
+#include "assets.h"
 #include "board_port.h"
 #include "color_test.h"
 #include "config.h"
 #include "hid.h"
+#include "icons.h"
 #include "stats_view.h"
 #include "theme.h"
 
@@ -109,6 +111,10 @@ lv_obj_t *makeTile(lv_obj_t *parent, bool enabled) {
   lv_obj_remove_style_all(tile);
   lv_obj_add_style(tile, enabled ? &theme::tile : &theme::tile_off, 0);
   if (enabled) lv_obj_add_style(tile, &theme::tile_press, LV_STATE_PRESSED);
+
+  // Buttons are scrollable by default. Harmless while every tile held one centred label, but an
+  // icon stack that overflows slightly would become draggable rather than simply clipped.
+  lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
   return tile;
 }
 
@@ -119,6 +125,98 @@ lv_obj_t *makeTileLabel(lv_obj_t *tile, const char *text, const lv_font_t *font,
   lv_obj_set_style_text_font(label, font, 0);
   lv_obj_center(label);
   return label;
+}
+
+// Gap between an icon and its label. Smaller than PAD, which separates whole tiles — the two
+// halves of one tile should read as a unit.
+constexpr int ICON_GAP = 6;
+
+// What this tile should show. Most specific wins: button, then theme, then settings.
+//
+// Settings is the only level allowed to be vague-free, so the chain always terminates. The
+// TileDisplay::Text at the end is unreachable via deck.json and exists only for the window
+// before ui::begin() has a config.
+TileDisplay displayFor(const Button &button) {
+  if (button.display != TileDisplay::Inherit) return button.display;
+  if (g_config == nullptr) return TileDisplay::Text;
+
+  const TileDisplay from_theme = g_config->theme().display;
+  if (from_theme != TileDisplay::Inherit) return from_theme;
+
+  return g_config->settings.display;
+}
+
+// Puts the icon and/or label inside a tile.
+//
+// Any icon that cannot be produced — unknown name, missing image, no `icon` field at all —
+// degrades to the text label. A half-iconned deck then reads as unfinished rather than broken,
+// which matters because icons arrive a few at a time.
+void fillTile(lv_obj_t *tile, const Button &button, bool enabled) {
+  TileDisplay mode = displayFor(button);
+
+  const char *symbol = nullptr;
+  const lv_image_dsc_t *image = nullptr;
+
+  if (mode != TileDisplay::Text && !button.icon.isEmpty()) {
+    if (button.icon.startsWith("/")) {
+      // A leading slash is the whole distinction between the two resolvers: it is already how
+      // every other SD path in deck.json is written, so there is nothing new to remember.
+      image = assets::load(button.icon);
+      if (image == nullptr) {
+        MD_LOG.printf("[ui] '%s': %s\n", button.id.c_str(), assets::lastError().c_str());
+      }
+    } else {
+      symbol = icons::symbol(button.icon);
+      if (symbol == nullptr) {
+        MD_LOG.printf("[ui] '%s' wants icon '%s', which is not a built-in symbol — showing "
+                      "its label instead\n",
+                      button.id.c_str(), button.icon.c_str());
+      }
+    }
+  }
+
+  if (symbol == nullptr && image == nullptr) mode = TileDisplay::Text;
+
+  // Text-only is one centred label. This is also every fallback path, so it stays the simplest
+  // branch in here.
+  if (mode == TileDisplay::Text) {
+    makeTileLabel(tile, button.label.c_str(), FONT_TILE, enabled);
+    return;
+  }
+
+  // Icon modes stack children vertically. Flex rather than hand-computed y offsets: tiles span
+  // one or two cells, so any fixed offset that centres a 1x1 tile is wrong on a 2x2 one.
+  lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(tile, ICON_GAP, 0);
+
+  if (image != nullptr) {
+    lv_obj_t *img = lv_image_create(tile);
+    lv_image_set_src(img, image);
+
+    // MDI1 carries no alpha, so a disabled image icon cannot simply fade. Recolouring towards
+    // the muted text colour keeps it legible instead of turning it to mud over a wallpaper —
+    // the same reasoning as tile_off.
+    if (!enabled && g_config != nullptr) {
+      lv_obj_set_style_image_recolor(img, lv_color_hex(g_config->theme().text_muted), 0);
+      lv_obj_set_style_image_recolor_opa(img, LV_OPA_60, 0);
+    }
+  } else {
+    // A symbol is just text, so it picks up the theme's label styling and disabled treatment
+    // with no special casing. Icon-only tiles get the larger font since nothing shares the room.
+    lv_obj_t *glyph = lv_label_create(tile);
+    lv_label_set_text(glyph, symbol);
+    lv_obj_add_style(glyph, enabled ? &theme::label : &theme::label_muted, 0);
+    lv_obj_set_style_text_font(
+        glyph, mode == TileDisplay::Icon ? theme::FONT_SYMBOL_LG : theme::FONT_SYMBOL, 0);
+  }
+
+  if (mode == TileDisplay::IconText && !button.label.isEmpty()) {
+    lv_obj_t *label = lv_label_create(tile);
+    lv_label_set_text(label, button.label.c_str());
+    lv_obj_add_style(label, enabled ? &theme::label : &theme::label_muted, 0);
+    lv_obj_set_style_text_font(label, FONT_BASE, 0);
+  }
 }
 
 void onTileEvent(lv_event_t *event) {
@@ -186,7 +284,7 @@ void buildGridPage(const Page &page) {
     lv_obj_set_size(tile, cell_w * button.w + PAD * (button.w - 1),
                     cell_h * button.h + PAD * (button.h - 1));
 
-    makeTileLabel(tile, button.label.c_str(), FONT_TILE, enabled);
+    fillTile(tile, button, enabled);
 
     auto *binding = new Binding{&button, page.id};
     g_bindings.push_back(binding);

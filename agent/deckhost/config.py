@@ -41,6 +41,23 @@ COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
 THEME_DISPLAY_VALUES = frozenset({"icon_text", "icon", "text"})
 
+# LVGL built-in symbols the firmware can render, mirroring kIcons in
+# firmware/multi_deck/icons.cpp. The naming rule there is mechanical — the LV_SYMBOL_ name
+# lowercased — so this list is the same list, not a translation of it.
+#
+# Worth validating because the firmware's fallback for an unknown name is to show the tile's
+# text label, which is indistinguishable from the `icon` field being ignored entirely. That is
+# the same silent-default failure the theme colour check exists for.
+ICON_NAMES = frozenset(
+    """
+    audio backspace bars battery_1 battery_2 battery_3 battery_empty battery_full bell
+    bluetooth bullet call charge close copy cut directory down download drive edit eject
+    envelope eye_close eye_open file gps home image keyboard left list loop minus mute
+    new_line next ok paste pause play plus power prev refresh right save sd_card settings
+    shuffle stop tint trash up upload usb video volume_max volume_mid warning wifi
+    """.split()
+)
+
 
 class ConfigError(Exception):
     pass
@@ -93,6 +110,17 @@ class DeckConfig:
         config.validate()
         return config
 
+    @property
+    def asset_root(self) -> Path | None:
+        """The folder that gets copied to the SD card: the one holding deck.json.
+
+        Wallpapers and icons are addressed from the card's root, so `/wall/dusk.bin` on the
+        device is `sdcard/wall/dusk.bin` here. That makes deck.json's own directory the
+        authority on what the card should contain, and means the asset stamp needs no
+        configuration of its own.
+        """
+        return self.path.parent if self.path is not None else None
+
     def _index(self) -> None:
         self.buttons = {}
         for page in self.raw.get("pages", []):
@@ -138,12 +166,22 @@ class DeckConfig:
                     problems.append(f"duplicate button id {button_id!r}")
                 seen.add(button_id)
 
+                self._validate_button(button, button_id, problems)
+
                 action = button.get("action") or {}
                 self._validate_action(
                     action, button_id, page_ids, theme_names, problems
                 )
 
-        start_theme = (self.raw.get("settings") or {}).get("theme")
+        settings = self.raw.get("settings") or {}
+        display = settings.get("display")
+        if display is not None and display not in THEME_DISPLAY_VALUES:
+            problems.append(
+                f"settings.display is {display!r}, expected one of "
+                f"{', '.join(sorted(THEME_DISPLAY_VALUES))}"
+            )
+
+        start_theme = settings.get("theme")
         if start_theme and start_theme not in theme_names:
             problems.append(
                 f"settings.theme {start_theme!r} matches no theme "
@@ -198,6 +236,46 @@ class DeckConfig:
                     f"theme {where}: display is {display!r}, expected one of "
                     f"{', '.join(sorted(THEME_DISPLAY_VALUES))}"
                 )
+
+    def _validate_button(
+        self, button: dict[str, Any], button_id: str, problems: list[str]
+    ) -> None:
+        """Checks the presentation fields, which fail silently on the device.
+
+        Both of these degrade to "show the label" when the firmware cannot make sense of them,
+        so a typo costs you the icon and tells you nothing.
+        """
+        display = button.get("display")
+        if display is not None and display not in THEME_DISPLAY_VALUES:
+            problems.append(
+                f"{button_id}: display is {display!r}, expected one of "
+                f"{', '.join(sorted(THEME_DISPLAY_VALUES))}"
+            )
+
+        icon = button.get("icon")
+        if not icon:
+            return
+
+        if not isinstance(icon, str):
+            problems.append(f"{button_id}: icon is {icon!r}, expected a string")
+            return
+
+        # A leading slash means an image on the SD card. Its existence cannot be checked from
+        # here — the card is the authority, and the asset stamp is what catches a stale one —
+        # so only the extension is worth a word.
+        if icon.startswith("/"):
+            if not icon.endswith(".bin"):
+                problems.append(
+                    f"{button_id}: icon {icon!r} looks like a path but is not a .bin — "
+                    "convert it with tools/make_assets.py icon"
+                )
+            return
+
+        if icon not in ICON_NAMES:
+            problems.append(
+                f"{button_id}: icon {icon!r} is not a built-in symbol. Use an SD path "
+                "starting with '/', or one of: " + ", ".join(sorted(ICON_NAMES))
+            )
 
     def _validate_action(
         self,

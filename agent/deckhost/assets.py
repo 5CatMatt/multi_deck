@@ -72,8 +72,17 @@ def write_stamp(root: Path) -> str:
 
 
 def read_stamp(root: Path) -> str:
-    """Reads a stamp file, the way the firmware does: first line, trimmed."""
+    """Reads a stamp file the way the firmware does: first line, trimmed.
+
+    An empty or blank file reads as no stamp rather than raising. write_stamp() never produces
+    one, but a truncated copy onto the card can — and that is exactly the moment this must not
+    be the thing that breaks.
+    """
     path = root / STAMP_FILE
     if not path.is_file():
         return ""
-    return path.read_text(encoding="ascii", errors="replace").strip().splitlines()[0].strip()
+
+    text = path.read_text(encoding="ascii", errors="replace").strip()
+    if not text:
+        return ""
+    return text.splitlines()[0].strip()

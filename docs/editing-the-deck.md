@@ -16,6 +16,11 @@ The device only reads its SD copy **at boot**, and only to have something to sho
 agent connects. The agent is authoritative: whenever the two disagree, the agent's copy wins and
 gets written to the card.
 
+Images are the exception, and the only thing in this file that does not hot-reload. They are too
+big for the link, so they only reach the card by hand — see [Wallpapers](#wallpapers).
+`sdcard/assets.ver` is a generated hash of everything else in `sdcard/`; leave it alone and let
+`tools/make_assets.py` write it. It is how the deck knows to tell you the card needs rewriting.
+
 ## Getting a change onto the deck
 
 ### The quick way — tray reload
@@ -137,6 +142,19 @@ Each wallpaper is 750 KB, which is nothing against a 32 GB card or 8 MB of PSRAM
 **2. Copy `sdcard/` to the card.** The device reads images from the card directly; the agent
 never sends them.
 
+Every conversion also rewrites `sdcard/assets.ver`, a hash of everything on the card. The device
+reads it at boot and reports it when it connects, and the agent compares it with what is in the
+repo — so if you forget this step, the deck says **"Assets are stale — copy sdcard/ to the card"**
+the next time it connects, and the agent log names both hashes.
+
+That check exists because forgetting to copy fails without failing: the old wallpaper is still on
+the card, so it loads, and nothing looks broken — you just quietly keep seeing the previous
+version. If you delete or rename an asset by hand rather than converting one, restamp:
+
+```powershell
+python tools/make_assets.py stamp
+```
+
 **3. Point a theme at it and turn the tiles translucent:**
 
 ```jsonc
@@ -158,6 +176,79 @@ starts fighting the photo.
 
 If the file is missing or malformed the theme falls back to its flat `bg` and says so on the
 port-A log — a bad path costs you the photo, never the screen.
+
+### Icons
+
+A tile can carry an icon as well as, or instead of, its label. One `"icon"` field, and the
+leading `/` decides how it is resolved:
+
+```jsonc
+{ "id": "edit.copy",   "label": "Copy",  "icon": "copy" }            // built-in symbol
+{ "id": "launch.code", "label": "Code",  "icon": "/icons/code.bin" } // image on the SD card
+```
+
+**Built-in symbols cost nothing** — no card, no conversion, no PSRAM. They live in the fonts that
+are already compiled in, and they render as text, so they pick up the theme's `text` colour and
+the disabled styling automatically. Use them for verbs.
+
+The name is **the LVGL symbol name, lowercased**. There are no aliases: it is `volume_mid`, not
+`volume`. The full list:
+
+```
+audio backspace bars battery_1 battery_2 battery_3 battery_empty battery_full bell
+bluetooth bullet call charge close copy cut directory down download drive edit eject
+envelope eye_close eye_open file gps home image keyboard left list loop minus mute
+new_line next ok paste pause play plus power prev refresh right save sd_card settings
+shuffle stop tint trash up upload usb video volume_max volume_mid warning wifi
+```
+
+A name outside that list is rejected on reload, because the device's fallback — show the label —
+is indistinguishable from the `icon` field being ignored.
+
+**Images** are for the things symbols cannot do, mainly brand logos on app launchers:
+
+```powershell
+python tools/make_assets.py icon logo.png --out sdcard/icons/code.bin --size 64
+```
+
+They are ordinary SD assets, so they need the card written and they are covered by the asset
+stamp. 64 px suits `icon_text`; 96 px suits `icon`, which has the whole tile to itself.
+
+### Tile anatomy
+
+`"display"` picks what a tile shows. It resolves **most specific first — button, then theme, then
+`settings`** — and every level except `settings` is optional:
+
+```jsonc
+"settings": { "display": "icon_text" }                    // the deck-wide default
+{ "name": "Kiosk", "display": "icon" }                    // this theme only, optional
+{ "id": "edit.paste_plain", "display": "text" }           // this tile only, optional
+```
+
+**A theme can absolutely own its anatomy** — a photo-heavy theme may want icon-only tiles while a
+light one wants labels, and setting `display` on the theme does exactly that. What `settings`
+provides is a *baseline*, so a theme that does not care can stay silent.
+
+That baseline is the only thing that changed. `display` was per-theme-only at first, with no
+baseline, so a theme that omitted it fell back to `text` — which meant adding a theme silently
+dropped every icon on the deck. Tiles still rendered, just as labels, so it read as "icons were
+never configured" rather than "one field is missing on one theme".
+
+The modes:
+
+| Value | Shows |
+|---|---|
+| `icon_text` | icon above the label — the general-purpose choice |
+| `icon` | icon only, larger. Good for a transport row where the symbol is unambiguous |
+| `text` | label only, larger. The behaviour before icons existed |
+
+Anything that cannot produce an icon — no `icon` field, an unknown name, a missing image —
+falls back to `text` on that tile alone. So a deck part-way through being iconned looks
+unfinished rather than broken, and the port-A log names the tile and the reason.
+
+Worth setting `text` deliberately when the label carries information the icon cannot:
+`edit.paste_plain` is "Paste Raw", and a paste icon would make it indistinguishable from
+ordinary paste.
 
 ### Switching themes
 

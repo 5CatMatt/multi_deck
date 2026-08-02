@@ -201,7 +201,65 @@ wrong way for a while. Symptom at the desk: every other agent launch does nothin
 
 **Rule:** inbound traffic is the authority on whether a host is present; the DTR flag is only ever
 corroborating evidence. Writes are never gated on it. Blocking is prevented instead by
-`setTxTimeoutMs(MD_CDC_TX_TIMEOUT_MS)` plus an `availableForWrite()` room check.
+`setTxTimeoutMs(MD_CDC_TX_TIMEOUT_MS)` **and nothing else** — see the next section, which is the
+same mistake made one layer down, and which kept this symptom alive after this fix landed.
+
+## ⚠️ The CDC TX FIFO is 64 bytes — never gate a write on `availableForWrite()`
+
+`USBCDC::availableForWrite()` returns free space in the TinyUSB CDC transmit FIFO, whose size is
+`CFG_TUD_CDC_TX_BUFSIZE` = **64 bytes**. It can never report more.
+
+So this, which `UsbLink::rawWrite()` did until 0.4.6, is not a flow-control check:
+
+```cpp
+if (g_cdc.availableForWrite() < static_cast<int>(len)) return false;   // WRONG
+```
+
+It is a **hard 64-byte ceiling on every frame the device can ever send**, written in a form that
+looks transient. Frames under 64 bytes go out; frames over it are dropped, always, with no error
+anywhere on the wire.
+
+### Why it survived a whole earlier investigation
+
+`hello` was **exactly 64 bytes** at 0.4.4:
+
+```
+{"t":"hello","proto":1,"fw":"0.4.4","dev":"multi_deck","rev":7}\n
+```
+
+`64 < 64` is false, so it passed — *but only when the FIFO was completely empty*. Any residue and
+the handshake silently failed. That is the true cause of the "every other launch does nothing"
+intermittency documented in the section above. Removing the `isAttached()` gate fixed one layer
+and left this one, so the symptom got rarer and looked solved.
+
+Adding one field to `hello` in 0.4.5 took it to 76 bytes and the deck stopped handshaking
+entirely — which is what finally made it findable.
+
+### The fix
+
+Delete the check. `USBCDC::write()` already loops internally: it writes what fits, calls
+`tud_cdc_n_write_flush()`, and repeats until done or until `tx_timeout_ms` expires (read it in
+`Arduino15/packages/esp32/hardware/esp32/<ver>/cores/esp32/USBCDC.cpp`). Blocking stays bounded by
+`setTxTimeoutMs()` without capping frame size — which is what the check was actually for.
+
+**General rule:** a "is there room?" guard against a fixed-size buffer *is* a size limit on the
+payload. If the payload can grow, the guard has to chunk, not refuse.
+
+### Diagnosing this
+
+The port-A log says it directly:
+
+```
+[link] identify received but hello could not be sent
+```
+
+Inbound works, outbound does not. **One-directional failure is always the local write path**, never
+the host — the host cannot cause your write to fail.
+
+`[link] partial write: N of M bytes` covers the remaining case. Note that a **zero**-byte write is
+deliberately *not* logged: `USBCDC::write()` returns 0 when the port is closed, which is normal for
+a second or two after a reset while the device announces itself before the host reopens COM. Only
+a partial write indicates a desynchronised stream.
 
 ## ✅ Benign boot warning: GT911 "Unable to initialize the I2C address"
 
@@ -407,6 +465,100 @@ And the ones that constrain what the UI can do:
 | `LV_USE_DRAW_SW_COMPLEX_GRADIENTS` | `0` | No radial or conical gradients. Two-stop linear (`bg_grad_dir = LV_GRAD_DIR_VER`) is unaffected — that flag only gates the complex kinds |
 | `LV_CACHE_DEF_SIZE` | `0` | Image cache off. Fine for RAM-resident RGB565 descriptors, which decode to a pointer. First knob to turn if wallpaper drawing stutters |
 | `LV_USE_FS_ARDUINO_SD` | `0` | LVGL cannot open SD paths itself; `assets.cpp` reads files and hands over a descriptor |
+
+## Fonts — what is built in, and how to add one
+
+Fonts are compiled into flash as `lv_font_t` C arrays. There is no runtime font loading: LVGL
+cannot read TTF, OTF or VLW on this build, so every face has to be converted first.
+
+**Built in already:** Montserrat 14 / 20 / 28 / 40, enabled in `lv_conf.h`. These carry the
+FontAwesome symbol range, which is where every `LV_SYMBOL_*` icon comes from — see the icon
+section of [editing-the-deck.md](editing-the-deck.md). **Adding a Montserrat size means editing
+the out-of-repo `lv_conf.h`** and is not something `tools/` can do for you.
+
+**Custom faces:** [tools/make_font.py](../tools/make_font.py) converts a TTF or OTF.
+
+```powershell
+python tools/make_font.py C:/Windows/Fonts/GOTHIC.TTF --name century --sizes 20 28 40
+```
+
+It writes `firmware/multi_deck/font_<name>_<size>.c`, one per size. Declare them in
+[fonts.h](../firmware/multi_deck/fonts.h) and expose them through `theme.h` alongside the
+Montserrat pointers. Century Gothic at 20/28/40 costs **43 KB of flash** for all three.
+
+### Why not lv_font_conv
+
+The official converter is a Node package, and there is no Node on this machine. `make_font.py`
+uses Pillow, which `tools/make_assets.py` already depends on, so a font can be regenerated
+without adding a second toolchain. What it gives up: **kerning** (lv_font_conv emits kern
+classes; this emits none — sub-pixel at these sizes, and a wrong kern table is worse than none)
+and **compression** (`--no-compress` equivalent, which is what we want anyway).
+
+### The fallback chain is not optional
+
+`lv_font_t.fallback` is resolved recursively by LVGL 9, and every generated font is baked with
+`.fallback = &lv_font_montserrat_<size>`.
+
+This matters because a generated font covers U+0020–U+007E only — no symbols. The stats detail
+line puts `LV_SYMBOL_UP` / `LV_SYMBOL_DOWN` **inside the same label as its text**, so without the
+fallback that line renders with holes in it. The fallback also covers any character outside
+ASCII.
+
+For the same reason a custom font is attached to **individual styles**, never to
+`theme::screen`: a screen-wide text font would push it onto the symbol labels that tiles use for
+their icons, and every icon on the deck would vanish.
+
+### The trap: Pillow's `getbbox()` is not the ink box
+
+It returns the *layout* box. For `"` it puts the bottom edge on the baseline when the ink stops
+less than halfway down, and it keeps the side bearings. Feeding that to LVGL yields `ofs_y = 0`
+for every glyph — quotes and apostrophes sit at the wrong height, and each glyph carries blank
+padding rows.
+
+`make_font.py` renders each glyph and takes `Image.getbbox()` of the result instead, which is
+tight, and which is what FreeType hands lv_font_conv. Tightening the boxes alone cut the 28 px
+bitmap from 14,074 to 11,357 bytes. **If glyph positioning ever looks wrong, check this first.**
+
+### VLW — converting TFT_eSPI fonts
+
+`make_font.py` also reads Processing/TFT_eSPI smooth fonts, either as raw `.vlw` or as the
+PROGMEM hex dump inside a TFT_eSPI `.h`:
+
+```powershell
+python tools/make_font.py fonts/Nord-Medium-28.vlw --name nord
+```
+
+Both formats store 8bpp antialiased bitmaps, so this is a transcode rather than a re-render — no
+quality is lost, but the size is fixed by the file and `--sizes` does not apply. Worth having
+when the original outline is gone and the baked bitmaps are all that survive. **If you do have
+the TTF, prefer it** — it converts to any size and could carry kerning.
+
+Layout, for reference:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 6 × `int32` BE | glyph count, version (11), size, unused, ascent, descent |
+| 24 | count × 7 × `int32` BE | code, height, width, advance, topExtent, leftExtent, pad |
+| … | Σ(w×h) | 8-bit alpha bitmaps, in glyph order |
+| end | ~27 bytes | Processing's trailing name metadata — ignore it, it is not corruption |
+
+Two gotchas:
+
+- **The header's `descent` is not trustworthy.** Every file to hand reports 0, which would put
+  the baseline on the floor of the line and clip every descender. `make_font.py` derives both
+  metrics from the glyph table instead — `ascent = max(topExtent)`,
+  `descent = max(height - topExtent)`.
+- **A VLW rarely covers all of ASCII.** Nord Medium is missing space, `<`, `>`, `^`, `` ` `` and
+  `~`. The emitter therefore uses a **sparse** cmap for gapped fonts rather than padding the gaps
+  with blank glyphs — a blank glyph would make the lookup *succeed* and draw nothing, which stops
+  `fallback` from ever being consulted. Sparse keeps missing characters missing, so they reach
+  Montserrat.
+
+### Unused fonts are free
+
+The linker runs with `--gc-sections`, so a generated font that nothing references is dropped
+entirely: adding the four Nord sizes to the sketch changed the binary by **0 bytes**. Fonts can
+sit declared in `fonts.h` until a style actually points at one.
 
 ## Why ESP32_Display_Panel but not its LVGL port
 

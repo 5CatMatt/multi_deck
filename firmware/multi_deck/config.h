@@ -8,7 +8,7 @@
 // Bump this with any behavioural firmware change. It rides along in the `hello` frame and the
 // agent logs it on connect, so "which build is actually on the device?" is answered by looking
 // rather than by remembering.
-#define MD_FW_VERSION    "0.4.4"
+#define MD_FW_VERSION    "0.5.4"
 #define MD_DEVICE_NAME   "multi_deck"
 #define MD_PROTO_VERSION 1
 
@@ -114,6 +114,20 @@ static_assert(!md_uses_panel_pin(MD_SD_MISO), "MD_SD_MISO is an RGB panel pin");
 #define MD_DECK_JSON_PATH "/deck.json"
 #define MD_ICON_DIR       "/icons"
 
+// Which generation of images the card holds, written by tools/make_assets.py and echoed back
+// in `hello` so the agent can compare it with the repo's. The device never computes it — it
+// only carries it.
+//
+// This exists because images are the one thing the link cannot keep in sync. Layout and colours
+// arrive over USB and are never stale; wallpapers and icons are copied to the card by hand, and
+// a card that was never rewritten fails silently — the old picture is still there, so nothing
+// errors and nothing looks wrong.
+#define MD_ASSET_STAMP_PATH "/assets.ver"
+
+// Longer than this is not a stamp, it is whatever else got written to that filename. Treated as
+// absent rather than reported, so a stray file cannot become a permanent phantom mismatch.
+static constexpr size_t MD_ASSET_STAMP_MAX = 32;
+
 // Which theme is currently selected, one name per line. Kept on SD rather than in NVS on
 // purpose: an NVS write stalls the CPU on the shared SPI1 bus and tears the RGB panel, while
 // the SD card is on its own bus. See docs/hardware-notes.md.
@@ -141,6 +155,11 @@ static constexpr uint32_t MD_LINK_HELLO_DEDUPE_MS = 300;
 
 // Cap on how long a CDC write may block. Without this a write to a host that is not draining
 // the port stalls the whole UI loop, since everything runs on one thread.
+//
+// This is the *only* thing that should bound a write. The CDC TX FIFO is 64 bytes, and gating
+// on whether a whole frame fits in it — which link_usb.cpp used to do — is a frame-size limit
+// wearing a flow-control disguise. USBCDC::write() chunks and flushes against this timeout by
+// itself. See the comment in UsbLink::rawWrite().
 static constexpr uint32_t MD_CDC_TX_TIMEOUT_MS = 20;
 
 // ---------------------------------------------------------------------------

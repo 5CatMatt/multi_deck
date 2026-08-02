@@ -1,5 +1,5 @@
 {
-  "rev": 7,
+  "rev": 11,
   "themes": [
     {
       "name": "Midnight",
@@ -65,6 +65,7 @@
     },
     {
       "name": "Paper",
+      "display": "text",
       "bg": "#e8e4dc",
       "tile": "#ffffff",
       "tile_grad": "#f2efe9",
@@ -76,13 +77,29 @@
       "text_muted": "#6b675e",
       "ok": "#2f6f4f",
       "idle": "#a8a49c"
+    },
+    {
+      "name": "Green",
+      "display": "icon",
+      "bg": "#0d0f0e",
+      "tile": "#5f8b8c",
+      "tile_grad": "#5f8b8c",
+      "border": "#5a5a52",
+      "border_opa": 0,
+      "radius": 12,
+      "accent": "#263838",
+      "text": "#f1efea",
+      "text_muted": "#6b675e",
+      "ok": "#2f6f4f",
+      "idle": "#a8a49c"
     }
   ],
   "settings": {
     "brightness": 80,
     "idle_dim_s": 60,
     "idle_off_s": 300,
-    "theme": "Stars"
+    "theme": "Stars",
+    "display": "icon_text"
   },
   "pages": [
     {
@@ -103,19 +120,21 @@
           }
         },
         {
-          "id": "launch.terminal",
-          "label": "Terminal",
-          "action": {
-            "type": "launch",
-            "target": "wt.exe"
-          }
-        },
-        {
           "id": "launch.explorer",
           "label": "Explorer",
+          "icon": "directory",
           "action": {
             "type": "launch",
             "target": "explorer.exe"
+          }
+        },
+        {
+          "id": "launch.terminal",
+          "label": "Terminal",
+          "icon": "keyboard",
+          "action": {
+            "type": "launch",
+            "target": "wt.exe"
           }
         },
         {
@@ -127,24 +146,43 @@
           }
         },
         {
-          "id": "launch.notepad",
-          "label": "Notepad",
+          "id": "macro.email",
+          "label": "Email",
+          "icon": "envelope",
           "action": {
-            "type": "launch",
-            "target": "notepad.exe"
+            "type": "hid_text",
+            "text": "you@example.com"
           }
         },
         {
-          "id": "launch.calc",
-          "label": "Calc",
+          "id": "macro.print",
+          "label": "Print",
+          "icon": "download",
           "action": {
-            "type": "launch",
-            "target": "calc.exe"
+            "type": "seq",
+            "steps": [
+              {
+                "type": "launch",
+                "target": "https://www.printables.com/"
+              },
+              {
+                "type": "delay",
+                "ms": 2500
+              },
+              {
+                "type": "hid",
+                "keys": [
+                  "CTRL",
+                  "d"
+                ]
+              }
+            ]
           }
         },
         {
           "id": "win.snap_left",
           "label": "Snap L",
+          "icon": "left",
           "action": {
             "type": "ahk",
             "fn": "SnapLeft"
@@ -153,6 +191,7 @@
         {
           "id": "win.snap_right",
           "label": "Snap R",
+          "icon": "right",
           "action": {
             "type": "ahk",
             "fn": "SnapRight"
@@ -172,6 +211,7 @@
         {
           "id": "sys.taskmgr",
           "label": "Task Mgr",
+          "icon": "list",
           "action": {
             "type": "hid",
             "keys": [
@@ -184,6 +224,7 @@
         {
           "id": "sys.desktop",
           "label": "Desktop",
+          "icon": "home",
           "action": {
             "type": "hid",
             "keys": [
@@ -194,7 +235,8 @@
         },
         {
           "id": "nav.macros",
-          "label": "Macros >",
+          "label": "Macros",
+          "icon": "right",
           "action": {
             "type": "page",
             "target": "macros"
@@ -211,9 +253,124 @@
         "rows": 3
       },
       "buttons": [
+          {
+          "id": "ui.theme",
+          "label": "Theme >",
+          "icon": "tint",
+          "action": {
+            "type": "theme",
+            "target": "next"
+          },
+          "hold": {
+            "type": "theme",
+            "target": "Midnight"
+          }
+        },
+        {
+          "id": "media.mute",
+          "label": "Mute",
+          "icon": "mute",
+          "action": {
+            "type": "media",
+            "key": "mute"
+          }
+        },
+        {
+          "id": "edit.undo",
+          "label": "Undo",
+          "icon": "refresh",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "z"
+            ]
+          }
+        },
+        {
+          "id": "edit.redo",
+          "label": "Redo",
+          "icon": "ok",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "y"
+            ]
+          }
+        },
+        {
+          "id": "launch.notepad",
+          "label": "Notepad",
+          "icon": "file",
+          "action": {
+            "type": "launch",
+            "target": "notepad.exe"
+          }
+        },
+        {
+          "id": "launch.calc",
+          "label": "Calc",
+          "icon": "plus",
+          "action": {
+            "type": "launch",
+            "target": "calc.exe"
+          }
+        },
+        
+        {
+          "id": "sys.screenshot",
+          "label": "Snip",
+          "icon": "image",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "GUI",
+              "SHIFT",
+              "s"
+            ]
+          }
+        },
+        {
+          "id": "macro.paint",
+          "label": "Paint",
+          "icon": "image",
+          "action": {
+            "type": "seq",
+            "steps": [
+              { "type": "launch", "target": "mspaint.exe" },
+              { "type": "ahk", "fn": "PasteInto", "args": ["ahk_exe mspaint.exe", "^+x"] }
+            ]
+          }
+        },
+        {
+          "id": "edit.save",
+          "label": "Save",
+          "icon": "save",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "s"
+            ]
+          }
+        },
+        {
+          "id": "edit.cut",
+          "label": "Cut",
+          "icon": "cut",
+          "action": {
+            "type": "hid",
+            "keys": [
+              "CTRL",
+              "x"
+            ]
+          }
+        },
         {
           "id": "edit.copy",
           "label": "Copy",
+          "icon": "copy",
           "action": {
             "type": "hid",
             "keys": [
@@ -225,123 +382,13 @@
         {
           "id": "edit.paste",
           "label": "Paste",
+          "icon": "paste",
           "action": {
             "type": "hid",
             "keys": [
               "CTRL",
               "v"
             ]
-          }
-        },
-        {
-          "id": "edit.paste_plain",
-          "label": "Paste Raw",
-          "action": {
-            "type": "hid",
-            "keys": [
-              "CTRL",
-              "SHIFT",
-              "v"
-            ]
-          }
-        },
-        {
-          "id": "edit.undo",
-          "label": "Undo",
-          "action": {
-            "type": "hid",
-            "keys": [
-              "CTRL",
-              "z"
-            ]
-          }
-        },
-        {
-          "id": "media.prev",
-          "label": "Prev",
-          "action": {
-            "type": "media",
-            "key": "prev"
-          }
-        },
-        {
-          "id": "media.play",
-          "label": "Play",
-          "action": {
-            "type": "media",
-            "key": "play_pause"
-          }
-        },
-        {
-          "id": "media.next",
-          "label": "Next",
-          "action": {
-            "type": "media",
-            "key": "next"
-          }
-        },
-        {
-          "id": "media.mute",
-          "label": "Mute",
-          "action": {
-            "type": "media",
-            "key": "mute"
-          }
-        },
-        {
-          "id": "macro.email",
-          "label": "Email",
-          "action": {
-            "type": "hid_text",
-            "text": "you@example.com"
-          }
-        },
-        {
-          "id": "macro.standup",
-          "label": "Standup",
-          "action": {
-            "type": "seq",
-            "steps": [
-              {
-                "type": "launch",
-                "target": "https://meet.google.com"
-              },
-              {
-                "type": "delay",
-                "ms": 2500
-              },
-              {
-                "type": "hid",
-                "keys": [
-                  "CTRL",
-                  "d"
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "id": "sys.screenshot",
-          "label": "Snip",
-          "action": {
-            "type": "hid",
-            "keys": [
-              "GUI",
-              "SHIFT",
-              "s"
-            ]
-          }
-        },
-        {
-          "id": "ui.theme",
-          "label": "Theme >",
-          "action": {
-            "type": "theme",
-            "target": "next"
-          },
-          "hold": {
-            "type": "theme",
-            "target": "Midnight"
           }
         }
       ]

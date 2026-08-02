@@ -47,9 +47,36 @@ bool UsbLink::rawWrite(const uint8_t *buf, size_t len) {
   // `hello` answering it. Reads were never gated, which is why the failure was one-directional
   // and looked like the host was at fault.
   //
-  // Blocking is prevented by the TX timeout set in begin() plus this room check, rather than
-  // by guessing whether anyone is listening.
-  if (g_cdc.availableForWrite() < static_cast<int>(len)) return false;
+  // Nor is there a room check any more, which was the same mistake one layer down.
+  //
+  // It used to refuse the write unless the whole frame fitted in availableForWrite(). That is
+  // the TinyUSB CDC TX FIFO, CFG_TUD_CDC_TX_BUFSIZE — **64 bytes** — so it was a hard 64-byte
+  // ceiling on every frame the device can ever send, expressed as a transient-looking check.
+  //
+  // `hello` sat at exactly 64 bytes, so it went out only when the FIFO happened to be empty.
+  // That is what made reconnects look intermittent for so long. Adding one field to `hello` in
+  // 0.4.5 took it to 76 and the deck could not handshake at all: it received `identify`, tried
+  // to answer, and silently refused, every time.
+  //
+  // USBCDC::write() already does the right thing — writes what fits, flushes, repeats until
+  // done or until the TX timeout set in begin() expires. Blocking stays bounded without
+  // capping frame size, which is what the check was actually for.
+  const size_t sent = g_cdc.write(buf, len);
+  if (sent == len) return true;
 
-  return g_cdc.write(buf, len) == len;
+  // Zero and partial are different events, and only one of them is a fault.
+  //
+  // Zero means USBCDC::write() found the port closed and never started — normal for the couple
+  // of seconds after a reset, while the device announces itself and the host has not reopened
+  // COM yet. poll() simply tries again. Logging that as a problem would put a scary line in
+  // every boot log, and a diagnostic that cries wolf is one nobody reads.
+  //
+  // A partial write is a real fault: the frame went out without its terminating newline, so the
+  // host joins it to the next one and drops the pair before resynchronising. Silence here is
+  // how the 64-byte ceiling hid for weeks, so this one is always said out loud.
+  if (sent > 0) {
+    MD_LOG.printf("[link] partial write: %u of %u bytes — host will drop the next frame too\n",
+                  static_cast<unsigned>(sent), static_cast<unsigned>(len));
+  }
+  return false;
 }

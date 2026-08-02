@@ -3,6 +3,7 @@
     python tools/make_assets.py wallpaper photo.jpg --out sdcard/wall/dusk.bin --dim 35
     python tools/make_assets.py wallpaper photos/*.jpg --out-dir sdcard/wall
     python tools/make_assets.py icon logo.png --out sdcard/icons/logo.bin --size 96
+    python tools/make_assets.py stamp
 
 Why raw rather than PNG or JPEG: decoding on the device costs time and heap at page-build
 time, and the SD card has 32GB spare. A full-screen wallpaper is 750KB either way once it is
@@ -23,6 +24,9 @@ looks like a bug, not a choice. `--anchor` decides which part of a tall photo su
 per-pixel blend on every redraw. Dimming at conversion time costs nothing at runtime, and the
 deck needs the headroom: this panel washes out dark tones (see docs/hardware-notes.md), so a
 wallpaper usually wants dimming to keep tile labels legible.
+
+Every run restamps `sdcard/assets.ver`, so the card can be checked against the repo. See
+deckhost/assets.py for why that exists.
 """
 
 from __future__ import annotations
@@ -33,9 +37,20 @@ import struct
 import sys
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parents[1]
+
+# The stamp is computed by the agent package rather than reimplemented here. Two copies of a
+# hash drift, and a drifted hash reports mismatches that are not real — which is worse than no
+# check at all, because you stop believing it.
+sys.path.insert(0, str(REPO / "agent"))
+from deckhost.assets import STAMP_FILE, write_stamp  # noqa: E402
+
 MAGIC = b"MDI1"
 SCREEN_W = 800
 SCREEN_H = 480
+
+# What gets copied to the card, and so what the stamp describes.
+SDCARD_ROOT = REPO / "sdcard"
 
 DEFAULT_ICON_BG = "1b2129"
 
@@ -208,6 +223,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="gaussian blur radius; a blurred copy makes a calmer backdrop for busy photos",
     )
 
+    sub.add_parser(
+        "stamp",
+        help=f"recompute sdcard/{STAMP_FILE} without converting anything",
+        description=(
+            "Rewrites the asset stamp from whatever is in sdcard/ now. Conversions do this "
+            "themselves; run it by hand after deleting or renaming an asset, which is the "
+            "one way the tree changes without this tool noticing."
+        ),
+    )
+
     icon = sub.add_parser("icon", help="convert a square icon")
     icon.add_argument("source", nargs="+", help="image files (globs allowed)")
     icon.add_argument("--out", type=Path, help="output .bin (single source only)")
@@ -222,8 +247,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _restamp(written: list[Path]) -> None:
+    """Rewrites sdcard/assets.ver so the card can be told apart from the repo.
+
+    Skipped when nothing landed under sdcard/ — converting into a scratch directory says
+    nothing about what the card should hold, and stamping anyway would claim a generation
+    that was never built.
+    """
+    if not any(_is_within(path, SDCARD_ROOT) for path in written):
+        print(f"note: nothing written under {SDCARD_ROOT}, {STAMP_FILE} left alone")
+        return
+
+    stamp = write_stamp(SDCARD_ROOT)
+    print(f"{STAMP_FILE} -> {stamp or '(no assets)'}")
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.mode == "stamp":
+        stamp = write_stamp(SDCARD_ROOT)
+        if not stamp:
+            print(f"no assets under {SDCARD_ROOT} — {STAMP_FILE} removed")
+        else:
+            print(f"{SDCARD_ROOT / STAMP_FILE} -> {stamp}")
+        return 0
 
     sources = _resolve_sources(args.source)
     if not sources:
@@ -238,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
             return _fail(f"--bg must be six hex digits, got {args.bg!r}")
 
     convert = convert_wallpaper if args.mode == "wallpaper" else convert_icon
-    total = 0
+    written: list[Path] = []
 
     for src in sources:
         dst = args.out if args.out is not None else args.out_dir / (src.stem + ".bin")
@@ -250,13 +305,16 @@ def main(argv: list[str] | None = None) -> int:
 
         size_kb = dst.stat().st_size / 1024
         print(f"{src.name} -> {dst}  ({width}x{height}, {size_kb:.0f} KB)")
-        total += 1
+        written.append(dst)
 
-    if total == 0:
+    if not written:
         return _fail("nothing converted")
 
-    print(f"\n{total} file(s) written. Copy the sdcard/ tree to the root of the SD card,")
+    _restamp(written)
+
+    print(f"\n{len(written)} file(s) written. Copy the sdcard/ tree to the root of the SD card,")
     print('then point a theme at it:  "wallpaper": "/wall/<name>.bin"')
+    print("Until the card is written the deck says so on connect — the stamp will not match.")
     return 0
 
 

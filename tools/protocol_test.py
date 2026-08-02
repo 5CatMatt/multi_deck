@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import time
 import unittest
@@ -19,7 +20,13 @@ sys.path.insert(0, str(REPO / "agent"))
 
 from deckhost import protocol  # noqa: E402
 from deckhost.actions import ActionRunner  # noqa: E402
-from deckhost.config import ConfigError, DeckConfig, is_device_local  # noqa: E402
+from deckhost.assets import STAMP_FILE, asset_stamp, read_stamp, write_stamp  # noqa: E402
+from deckhost.config import (  # noqa: E402
+    ICON_NAMES,
+    ConfigError,
+    DeckConfig,
+    is_device_local,
+)
 from deckhost.link import LinkError, SerialLink, SimulatedLink  # noqa: E402
 from deckhost.main import DeckHost  # noqa: E402
 from deckhost.stats import StatsCollector, _find_lhm_cpu_temp  # noqa: E402
@@ -595,6 +602,325 @@ class AssetFormatTests(unittest.TestCase):
         self.assertEqual(dimmed.getpixel((0, 0)), (100, 50, 25))
 
 
+class IconNameTests(unittest.TestCase):
+    """config.py's ICON_NAMES and firmware/icons.cpp's kIcons must be the same list.
+
+    They cannot disagree loudly. A name the firmware knows but the agent does not is rejected
+    as a typo you did not make; a name the agent knows but the firmware does not passes
+    validation and then renders as text on the deck. Both look like the icon field being
+    ignored, which is exactly the failure this validation was added to prevent.
+    """
+
+    def _firmware_names(self) -> set[str]:
+        source = (REPO / "firmware" / "multi_deck" / "icons.cpp").read_text(encoding="utf-8")
+        table = re.search(r"kIcons\[\]\s*=\s*\{(.*?)\n\};", source, re.S)
+        self.assertIsNotNone(table, "could not find the kIcons table in icons.cpp")
+        return set(re.findall(r'\{"([a-z0-9_]+)",\s*LV_SYMBOL_', table.group(1)))
+
+    def test_lists_agree(self):
+        firmware = self._firmware_names()
+        self.assertTrue(firmware, "parsed no icon names out of icons.cpp")
+
+        self.assertEqual(
+            firmware,
+            set(ICON_NAMES),
+            "icons.cpp and config.py ICON_NAMES have drifted",
+        )
+
+    def test_names_follow_the_lowercase_lv_symbol_rule(self):
+        # The rule that makes the two lists maintainable without a mapping table.
+        for name in self._firmware_names():
+            with self.subTest(name=name):
+                self.assertEqual(name, name.lower())
+                self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
+
+
+class IconValidationTests(unittest.TestCase):
+    """Presentation fields fail silently on the device, so they are checked here."""
+
+    @staticmethod
+    def _config(button: dict) -> dict:
+        return {"rev": 1, "pages": [{"id": "p", "buttons": [button]}]}
+
+    def _load(self, button: dict) -> DeckConfig:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deck.json"
+            path.write_text(json.dumps(self._config(button)), encoding="utf-8")
+            return DeckConfig.load(path)
+
+    def _reject(self, button: dict, fragment: str) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            self._load(button)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_known_symbol_accepted(self):
+        self._load({"id": "b", "icon": "play", "action": {"type": "media", "key": "play"}})
+
+    def test_sd_path_accepted_without_touching_the_card(self):
+        self._load(
+            {
+                "id": "b",
+                "icon": "/icons/code.bin",
+                "action": {"type": "launch", "target": "code"},
+            }
+        )
+
+    def test_typo_rejected(self):
+        # "volume" is the natural thing to type; the symbol is volume_mid. Exactly the case
+        # that would otherwise show a text label and look like the field did nothing.
+        self._reject(
+            {"id": "b", "icon": "volume", "action": {"type": "media", "key": "mute"}},
+            "not a built-in symbol",
+        )
+
+    def test_unconverted_image_rejected(self):
+        self._reject(
+            {"id": "b", "icon": "/icons/code.png", "action": {"type": "launch"}},
+            "not a .bin",
+        )
+
+    def test_unknown_display_mode_rejected(self):
+        self._reject(
+            {"id": "b", "display": "icon-text", "action": {"type": "page", "target": "p"}},
+            "expected one of",
+        )
+
+    def test_no_icon_is_fine(self):
+        self._load({"id": "b", "label": "Go", "action": {"type": "page", "target": "p"}})
+
+    def test_bad_settings_display_rejected(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deck.json"
+            path.write_text(
+                json.dumps({"rev": 1, "pages": [], "settings": {"display": "icons"}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigError) as caught:
+                DeckConfig.load(path)
+            self.assertIn("settings.display", str(caught.exception))
+
+    def test_shipped_deck_has_a_display_baseline(self):
+        # Only that a baseline exists, so a theme which says nothing cannot silently land on
+        # text and look like the icons were never configured.
+        #
+        # Deliberately says nothing about whether themes set `display` themselves — that is a
+        # per-theme choice the format is meant to support, not something to standardise away.
+        config = DeckConfig.load(REPO / "sdcard" / "deck.json")
+
+        self.assertIn(
+            "display",
+            config.raw.get("settings", {}),
+            "settings.display should carry the deck-wide baseline",
+        )
+
+    def test_a_theme_may_override_the_baseline(self):
+        """Per-theme anatomy is a supported choice, not a legacy path."""
+        import tempfile
+
+        deck = {
+            "rev": 1,
+            "settings": {"display": "icon_text", "theme": "Kiosk"},
+            "themes": [
+                {"name": "Kiosk", "display": "icon"},
+                {"name": "Reader", "display": "text"},
+                {"name": "Default"},
+            ],
+            "pages": [
+                {"id": "p", "buttons": [{"id": "b", "icon": "play", "action": {"type": "media", "key": "play_pause"}}]}
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deck.json"
+            path.write_text(json.dumps(deck), encoding="utf-8")
+            config = DeckConfig.load(path)
+
+        themes = {t["name"]: t.get("display") for t in config.raw["themes"]}
+        self.assertEqual(themes["Kiosk"], "icon")
+        self.assertEqual(themes["Reader"], "text")
+        self.assertIsNone(themes["Default"], "an unset theme inherits rather than defaulting")
+
+
+class AssetStampTests(unittest.TestCase):
+    """The stamp must change when the card would need rewriting, and not otherwise.
+
+    Both halves matter. A stamp that misses a change is a check that does not work; a stamp
+    that changes when nothing did is worse, because it trains you to ignore the warning.
+    """
+
+    def _tree(self, tmp: str) -> Path:
+        root = Path(tmp)
+        (root / "wall").mkdir()
+        (root / "wall" / "dusk.bin").write_bytes(b"pixels")
+        (root / "deck.json").write_text("{}", encoding="utf-8")
+        return root
+
+    def test_empty_tree_has_no_stamp(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # No assets means nothing to keep in sync, so a fresh checkout does not nag.
+            self.assertEqual(asset_stamp(Path(tmp)), "")
+
+    def test_content_change_moves_the_stamp(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._tree(tmp)
+            before = asset_stamp(root)
+
+            (root / "wall" / "dusk.bin").write_bytes(b"different")
+            self.assertNotEqual(asset_stamp(root), before)
+
+    def test_rename_moves_the_stamp(self):
+        # Paths are hashed alongside contents: a theme points at "/wall/dusk.bin", so the same
+        # bytes under a new name still means the card is wrong.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._tree(tmp)
+            before = asset_stamp(root)
+
+            (root / "wall" / "dusk.bin").rename(root / "wall" / "dawn.bin")
+            self.assertNotEqual(asset_stamp(root), before)
+
+    def test_layout_edits_do_not_move_the_stamp(self):
+        # deck.json travels over USB and has its own rev. If it counted, every colour tweak
+        # would claim the images were stale.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._tree(tmp)
+            before = asset_stamp(root)
+
+            (root / "deck.json").write_text('{"rev": 99}', encoding="utf-8")
+            self.assertEqual(asset_stamp(root), before)
+
+    def test_stamp_file_does_not_describe_itself(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._tree(tmp)
+            before = asset_stamp(root)
+
+            written = write_stamp(root)
+            self.assertEqual(written, before)
+            # Writing it must not change the answer, or no two runs would ever agree.
+            self.assertEqual(asset_stamp(root), before)
+            self.assertEqual(read_stamp(root), before)
+
+    def test_write_stamp_removes_a_stamp_with_nothing_left_to_describe(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._tree(tmp)
+            write_stamp(root)
+            self.assertTrue((root / STAMP_FILE).exists())
+
+            (root / "wall" / "dusk.bin").unlink()
+            self.assertEqual(write_stamp(root), "")
+            # A leftover stamp would claim a generation that no longer exists.
+            self.assertFalse((root / STAMP_FILE).exists())
+
+    def test_read_stamp_matches_how_the_firmware_reads_it(self):
+        # assets.cpp does readStringUntil('\n') then trim(). Anything the writer emits that
+        # this does not survive would produce a permanent phantom mismatch.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / STAMP_FILE).write_text("abc123def456\n", encoding="ascii")
+            self.assertEqual(read_stamp(root), "abc123def456")
+
+            # A truncated copy onto the card must read as "no stamp", not raise.
+            (root / STAMP_FILE).write_text("", encoding="ascii")
+            self.assertEqual(read_stamp(root), "")
+
+    def test_shipped_card_is_stamped_and_current(self):
+        root = REPO / "sdcard"
+        expected = asset_stamp(root)
+        if not expected:
+            self.skipTest("no assets in sdcard/")
+
+        # Catches the commit that adds a wallpaper and forgets to restamp — at which point
+        # every connect would warn about a card that is actually fine.
+        self.assertEqual(
+            read_stamp(root),
+            expected,
+            f"sdcard/{STAMP_FILE} is out of date — run: python tools/make_assets.py stamp",
+        )
+
+
+class AssetSyncWarningTests(unittest.IsolatedAsyncioTestCase):
+    """What the agent says on connect about the card's images."""
+
+    ONE_ASSET = {"wall/dusk.bin": b"pixels"}
+
+    async def _toasts_for(self, files: dict[str, bytes], hello_for) -> list[str]:
+        """Builds a repo tree, then asks `hello_for(current_stamp)` for the frame to test.
+
+        The callback exists so a test can say "the card agrees" without hardcoding a hash.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "deck.json").write_text(
+                json.dumps({"rev": 1, "pages": []}), encoding="utf-8"
+            )
+            for name, data in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+
+            config = DeckConfig.load(root / "deck.json")
+            link = SimulatedLink([], rev=1, step_delay=0.01)
+            host = DeckHost(
+                link, config, ActionRunner(dry_run=True), StatsCollector(synthetic=True)
+            )
+
+            await host._check_assets(hello_for(asset_stamp(root)))
+            return [f["msg"] for f in link.received if f["t"] == "toast"]
+
+    async def test_matching_stamp_says_nothing(self):
+        toasts = await self._toasts_for(
+            self.ONE_ASSET, lambda current: protocol.hello(assets=current)
+        )
+        self.assertEqual(toasts, [])
+
+    async def test_stale_stamp_warns(self):
+        toasts = await self._toasts_for(
+            self.ONE_ASSET, lambda _: protocol.hello(assets="000000000000")
+        )
+        self.assertEqual(len(toasts), 1)
+        self.assertIn("stale", toasts[0].lower())
+
+    async def test_unstamped_card_warns_differently(self):
+        # A card written before stamps existed. Its images may well be fine, so the message
+        # must not assert they are wrong.
+        toasts = await self._toasts_for(
+            self.ONE_ASSET, lambda _: protocol.hello(assets="")
+        )
+        self.assertEqual(len(toasts), 1)
+        self.assertNotIn("stale", toasts[0].lower())
+
+    async def test_device_without_a_card_says_nothing(self):
+        # The field is absent, which is also what firmware older than the stamp sends. Neither
+        # is evidence of anything, and a deck with no card already complains on screen.
+        toasts = await self._toasts_for(self.ONE_ASSET, lambda _: protocol.hello())
+        self.assertEqual(toasts, [])
+
+    async def test_repo_without_assets_says_nothing(self):
+        toasts = await self._toasts_for(
+            {}, lambda _: protocol.hello(assets="000000000000")
+        )
+        self.assertEqual(toasts, [])
+
+
 class SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_handshake_pushes_layout_on_rev_mismatch(self):
         config = DeckConfig.load(REPO / "sdcard" / "deck.json")
@@ -610,19 +936,50 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("layout", kinds)
         self.assertEqual(link.rev, config.rev)
 
+    @staticmethod
+    def _mixed_sequence(config: DeckConfig) -> tuple[str, list[dict]]:
+        """Finds a button whose action is a seq mixing agent-side and device-local steps.
+
+        Looked up rather than named. This test hardcoded a button id and was broken twice by
+        ordinary layout edits renaming it — a failure that says nothing about the behaviour
+        under test, and trains you to ignore the suite.
+        """
+        for button_id, button in config.buttons.items():
+            action = button.get("action") or {}
+            if action.get("type") != "seq":
+                continue
+
+            steps = action.get("steps", [])
+            has_local = any(
+                s.get("type") != "delay" and is_device_local(s) for s in steps
+            )
+            has_agent = any(not is_device_local(s) for s in steps)
+            if has_local and has_agent:
+                return button_id, steps
+
+        raise unittest.SkipTest("shipped deck.json has no mixed sequence to exercise")
+
     async def test_mixed_sequence_calls_back_for_local_steps(self):
         """The ordering guarantee: the agent sequences, the device performs local steps."""
         config = DeckConfig.load(REPO / "sdcard" / "deck.json")
-        link = SimulatedLink(["macro.standup"], rev=1, step_delay=0.01)
+        button_id, steps = self._mixed_sequence(config)
 
+        link = SimulatedLink([button_id], rev=1, step_delay=0.01)
         host = DeckHost(
             link, config, ActionRunner(dry_run=True), StatsCollector(synthetic=True)
         )
-        # macro.standup is launch -> delay 2500ms -> hid, so allow for the delay.
-        await host.run(duration=3.2)
 
-        self.assertEqual(len(link.hid_exec_calls), 1)
-        self.assertEqual(link.hid_exec_calls[0]["type"], "hid")
+        # Wait out whatever delays the sequence actually contains, rather than a magic number
+        # that silently becomes too short when someone lengthens a step.
+        delay_s = sum(s.get("ms", 0) for s in steps if s.get("type") == "delay") / 1000
+        await host.run(duration=delay_s + 0.7)
+
+        local_steps = [s for s in steps if s.get("type") != "delay" and is_device_local(s)]
+        self.assertEqual(len(link.hid_exec_calls), len(local_steps))
+        self.assertEqual(
+            [c["type"] for c in link.hid_exec_calls],
+            [s["type"] for s in local_steps],
+        )
 
     async def test_unknown_button_produces_toast_not_crash(self):
         config = DeckConfig.load(REPO / "sdcard" / "deck.json")

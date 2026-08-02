@@ -11,6 +11,7 @@
 
 #include <ArduinoJson.h>
 
+#include "assets.h"
 #include "board_port.h"
 #include "config.h"
 #include "deck_config.h"
@@ -115,6 +116,12 @@ void setup() {
     }
     // After the layout, so there is a theme list to match the saved name against.
     g_config.loadPersistedTheme(MD_THEME_STATE_PATH);
+
+    // Only inside this branch: with no card there is nothing to report a generation for, and
+    // an empty stamp would read as "this card is unstamped" rather than "there is no card".
+    const String &stamp = assets::stamp();
+    g_link.setAssetStamp(stamp);
+    MD_LOG.printf("[assets] card stamp %s\n", stamp.isEmpty() ? "(none)" : stamp.c_str());
   } else {
     g_config.loadFallback();
   }

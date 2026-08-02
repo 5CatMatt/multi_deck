@@ -57,12 +57,26 @@ class Link {
   bool was_attached_ = false;
   int host_rev_ = -1;
   int device_rev_ = 0;
+  String asset_stamp_;
+  bool have_asset_stamp_ = false;
   uint32_t last_inbound_ms_ = 0;
   uint32_t last_hello_ms_ = 0;
 
  public:
   // The layout revision reported in hello. Set before begin().
   void setDeviceRev(int rev) { device_rev_ = rev; }
+
+  // The card's asset generation, reported in hello. Call this only when an SD card is actually
+  // mounted, including when the stamp itself is empty: the two cases mean different things.
+  //
+  // No card at all means the agent has nothing to compare and must stay quiet — the missing
+  // images already announce themselves loudly elsewhere. A mounted card with no stamp file is
+  // a real answer: this card was written before stamps existed. Never called, and the field is
+  // omitted from the frame entirely, which is also what firmware predating this reports.
+  void setAssetStamp(const String &stamp) {
+    asset_stamp_ = stamp;
+    have_asset_stamp_ = true;
+  }
 };
 
 // USB CDC transport over the native USB port (port B), alongside the HID interfaces.

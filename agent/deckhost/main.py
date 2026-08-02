@@ -15,6 +15,7 @@ from typing import Any
 
 from . import protocol
 from .actions import ActionRunner
+from .assets import STAMP_FILE, asset_stamp
 from .config import ConfigError, DeckConfig
 from .link import Link, LinkError, SerialLink, SimulatedLink
 from .stats import StatsCollector
@@ -246,6 +247,9 @@ class DeckHost:
 
         await self._send(protocol.welcome(self.host_name, self.config.rev))
 
+        if not was_up:
+            await self._check_assets(frame)
+
         device_rev = frame.get("rev", -1)
         if device_rev != self.config.rev and not self._layout_pushed:
             log.info(
@@ -253,6 +257,61 @@ class DeckHost:
             )
             self._layout_pushed = True
             await self._push_layout()
+
+    async def _check_assets(self, frame: dict[str, Any]) -> None:
+        """Tells the deck when the images on its card are older than the ones here.
+
+        The layout cannot go stale — it is pushed whenever the revisions disagree. Images can,
+        because they only reach the card by hand, and a card that was never rewritten fails
+        without failing: the old wallpaper is still present, so it loads, and nothing anywhere
+        says the version on screen is not the one you made. That is the gap this closes.
+
+        Deliberately quiet in every ambiguous case. A check that cries wolf gets ignored, and
+        this one only gets read when something is already confusing.
+        """
+        if "assets" not in frame:
+            # No card mounted, or firmware older than the stamp. Either way there is nothing
+            # to compare against — and a deck with no card already says so on screen.
+            log.debug("device reported no asset stamp")
+            return
+
+        root = self.config.asset_root
+        if root is None:
+            return
+
+        # Hashes every file under sdcard/ — a few megabytes, so single-digit milliseconds, and
+        # only on connect. Worth revisiting if the asset tree ever gets large enough to notice.
+        expected = asset_stamp(root)
+        if not expected:
+            return  # nothing here to sync, so nothing on the card can be out of date
+
+        device = frame["assets"]
+        if device == expected:
+            log.debug("assets current (%s)", expected)
+            return
+
+        if device:
+            log.warning(
+                "assets on the card are stale: card %s, %s %s — copy %s to the card",
+                device,
+                root.name,
+                expected,
+                root,
+            )
+            await self._send(
+                protocol.toast("Assets are stale — copy sdcard/ to the card", "warn")
+            )
+        else:
+            # A card written before stamps existed. Says nothing about whether the images on
+            # it are current, so the wording asks for a copy without claiming they are wrong.
+            log.warning(
+                "card carries no %s, so its assets cannot be checked — copy %s to the card",
+                STAMP_FILE,
+                root,
+            )
+            await self._send(
+                protocol.toast("Card has no asset stamp — copy sdcard/ to it", "warn")
+            )
 
     async def _on_press(self, frame: dict[str, Any]) -> None:
         button_id = frame.get("id", "")
@@ -400,7 +459,7 @@ async def async_main(argv: list[str] | None = None) -> int:
         # action, and a mixed sequence.
         script = [
             button_id
-            for button_id in ("launch.notepad", "win.snap_left", "macro.standup")
+            for button_id in ("launch.notepad", "win.snap_left", "macro.print")
             if button_id in config.buttons
         ]
         link: Link = SimulatedLink(script, rev=-1)

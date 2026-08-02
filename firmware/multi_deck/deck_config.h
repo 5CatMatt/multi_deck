@@ -44,8 +44,13 @@ struct Action {
   bool isLocal() const;
 };
 
-// What a tile shows. `Inherit` on a button means "use the theme's default"; a theme itself
-// never holds Inherit.
+// What a tile shows, resolved most-specific-first: button, then theme, then settings.
+//
+// `Inherit` means "ask the next level out". Only `Settings::display` is required to be
+// concrete, so a deck states its anatomy once and a theme opts out only if it wants to.
+// Making every theme repeat it was the original design, and adding a theme then silently
+// dropped every icon on the deck — the tiles still rendered, just as text, which looks like
+// the icons were never configured rather than like a missing field.
 enum class TileDisplay : uint8_t { Inherit, IconText, Icon, Text };
 
 struct Button {
@@ -101,7 +106,10 @@ struct Theme {
   uint8_t radius = 10;
 
   bool flip180 = MD_ROTATE_180;
-  TileDisplay display = TileDisplay::Text;
+
+  // Inherit by default: a theme is about colour, and most decks want one anatomy throughout.
+  // Set it here only for a theme that genuinely wants a different one.
+  TileDisplay display = TileDisplay::Inherit;
 
   // Prints every token as it ended up after parsing and defaulting. This exists to answer
   // "did my edit actually reach the device, and as what?" by looking rather than by guessing —
@@ -119,6 +127,11 @@ struct Settings {
   int idle_dim_s = 60;
   int idle_off_s = 300;
   String theme_name;  // which theme to start on; empty means the first
+
+  // The root of the display chain, and the only level that must be concrete. IconText rather
+  // than Text because a tile with no usable icon falls back to text anyway — so this default
+  // costs a deck without icons nothing, and saves a deck with them from having to say so.
+  TileDisplay display = TileDisplay::IconText;
 };
 
 class DeckConfig {

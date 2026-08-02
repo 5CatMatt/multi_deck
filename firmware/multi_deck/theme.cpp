@@ -2,11 +2,13 @@
 
 #include "assets.h"
 #include "config.h"
+#include "fonts.h"
 
 namespace theme {
 
 lv_style_t screen;
 lv_style_t surface;
+lv_style_t panel;
 lv_style_t nav_scrim;
 lv_style_t tile;
 lv_style_t tile_press;
@@ -19,7 +21,22 @@ lv_style_t toast;
 
 const lv_font_t *const FONT_BASE = &lv_font_montserrat_20;
 const lv_font_t *const FONT_TILE = &lv_font_montserrat_28;
-const lv_font_t *const FONT_PAD = &lv_font_montserrat_40;
+
+// Nord Medium for the ten-key alone, transcoded from the .vlw files in fonts/. Its digits are
+// squarer and more evenly weighted than Montserrat's, which suits a keypad — the one place on
+// the deck where the glyphs are large, isolated, and read as a numeric block rather than as
+// words. Everywhere else Montserrat won on the panel.
+//
+// Self-contained: every ten-key label (digits, / * - + . "Num" "Ent") is inside Nord's coverage,
+// so this needs nothing from the fallback chain.
+const lv_font_t *const FONT_PAD = &md_font_nord_40;
+
+const lv_font_t *const FONT_SYMBOL = &lv_font_montserrat_28;
+const lv_font_t *const FONT_SYMBOL_LG = &lv_font_montserrat_40;
+
+const lv_font_t *const FONT_STAT_VALUE = &md_font_century_40;
+const lv_font_t *const FONT_STAT_LABEL = &md_font_century_28;
+const lv_font_t *const FONT_STAT_TEXT = &md_font_century_20;
 
 namespace {
 
@@ -47,6 +64,7 @@ void initOnce() {
   if (g_initialised) return;
   lv_style_init(&screen);
   lv_style_init(&surface);
+  lv_style_init(&panel);
   lv_style_init(&nav_scrim);
   lv_style_init(&tile);
   lv_style_init(&tile_press);
@@ -62,6 +80,7 @@ void initOnce() {
 void resetAll() {
   lv_style_reset(&screen);
   lv_style_reset(&surface);
+  lv_style_reset(&panel);
   lv_style_reset(&nav_scrim);
   lv_style_reset(&tile);
   lv_style_reset(&tile_press);
@@ -149,6 +168,18 @@ void apply(const Theme &t) {
   lv_style_set_border_width(&surface, 0);
   lv_style_set_pad_all(&surface, 0);
   lv_style_set_radius(&surface, 0);
+
+  // --- panel -------------------------------------------------------------------------------
+  // Holds a readout rather than a press target, so: the same fill as a tile, because the deck
+  // should read as one thing, plus interior padding and no press transition.
+  //
+  // Deliberately kept at the theme's own tile_opa rather than made opaque. The wallpaper is the
+  // part of this deck people actually like, and the arithmetic behind "the stats page is too
+  // expensive to composite" does not hold: three 160px arcs and a 760x124 chart redrawn at 1 Hz
+  // is under half a full-screen repaint per second. Where the readability problem is real — a
+  // 1px chart line over a starfield — it is fixed on the chart itself.
+  styleAsCard(&panel, t, opaOf(t.tile_opa));
+  lv_style_set_pad_all(&panel, CARD_PAD);
 
   // --- tiles -------------------------------------------------------------------------------
   styleAsCard(&tile, t, opaOf(t.tile_opa));
