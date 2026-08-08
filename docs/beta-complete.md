@@ -60,7 +60,9 @@ something annoys you is worth more than a design session later.
 
 | Date | Observation | Thought |
 |---|---|---|
-| | | |
+| 2026-08-02 | Sleep broke the agent link permanently; a reboot was the only cure | Not a sleep bug — the port always came back, the *handshake* had no deadline. Fixed; recovery is now ~1s |
+| 2026-08-02 | The drawn dim is clearly noticeable, with no hardware change | Software dimming is sufficient for desk use. Narrows what the PWM rewire is still for — see item 1 |
+| 2026-08-02 | Calendar content is right; styling wants low-level tweaks | Not yet specified |
 
 Things worth paying attention to specifically:
 
@@ -77,11 +79,31 @@ Things worth paying attention to specifically:
 
 Ordered by value-for-effort, not by ambition.
 
-### 1. PWM backlight — **the firmware is done; only the soldering is left**
+### 1. PWM backlight — **firmware done; whether to solder is now a real question**
 
 The backlight enable is a bare on/off line on CH422G EXIO2, which has no PWM. Move it to a free
 GPIO and `brightness`, `dim_pct` and the `backlight` frame all become literal instead of
 approximate.
+
+**The drawn overlay turned out to be more effective than expected** (feedback log, 2026-08-02),
+which changes the calculus. Software dimming darkens the *image* convincingly, so for a deck on a
+lit desk the rewire may buy nothing worth a soldering iron.
+
+What drawing cannot do, at all:
+
+- **Reduce emitted light.** The backlight still runs at full power behind a dark image, so the
+  panel remains a uniform glow source. Irrelevant in a lit room; the whole point in a dark one.
+- **Save power.** Not that this board is battery-powered.
+
+That makes the deciding question narrow: **does the deck sit somewhere that is dark while the PC
+is asleep?** If yes, the rewire matters and matters most for the sleep clock — that is the one
+feature designed to be on for hours in a possibly-dark room, and it is exactly where `dim_pct: 15`
+currently does nothing at all. If the deck lives in a lit room, or gets switched off rather than
+showing a clock, this is optional polish and should be treated as such.
+
+Software has hit its ceiling here rather than merely not tried: `sleep_view` already paints an
+opaque black ground with heavily muted text. The remaining glow is backlight leakage, and no
+amount of drawing touches it.
 
 **The software side is written, compiled and guard-tested.** Doing the mod is three steps:
 
