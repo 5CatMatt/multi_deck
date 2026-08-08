@@ -334,6 +334,62 @@ class ConfigValidationTests(unittest.TestCase):
                 DeckConfig.load(path)
             self.assertIn("calender", str(caught.exception))
 
+    def test_timing_settings_must_be_whole_seconds(self):
+        """A string here is ignored by ArduinoJson's `| default`, so the edit vanishes silently."""
+        import tempfile
+
+        for key, bad in (
+            ("idle_dim_s", "120"),
+            ("idle_off_s", 12.5),
+            ("sleep_clock_s", True),
+        ):
+            with self.subTest(key=key, bad=bad):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = self._write(
+                        Path(tmp), {"rev": 1, "settings": {key: bad}, "pages": []}
+                    )
+                    with self.assertRaises(ConfigError) as caught:
+                        DeckConfig.load(path)
+                    self.assertIn(key, str(caught.exception))
+
+    def test_negative_timing_rejected(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp), {"rev": 1, "settings": {"sleep_clock_s": -5}, "pages": []}
+            )
+            with self.assertRaises(ConfigError) as caught:
+                DeckConfig.load(path)
+            self.assertIn("sleep_clock_s", str(caught.exception))
+
+    def test_zero_timings_are_allowed(self):
+        """Zero is the documented way to switch a stage off, not a mistake."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                {
+                    "rev": 1,
+                    "settings": {"idle_dim_s": 0, "idle_off_s": 0, "sleep_clock_s": 0},
+                    "pages": [],
+                },
+            )
+            DeckConfig.load(path)
+
+    def test_off_below_dim_is_reported(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                {"rev": 1, "settings": {"idle_dim_s": 300, "idle_off_s": 60}, "pages": []},
+            )
+            with self.assertRaises(ConfigError) as caught:
+                DeckConfig.load(path)
+            self.assertIn("without ever dimming", str(caught.exception))
+
     def test_known_page_types_accepted(self):
         import tempfile
 

@@ -474,6 +474,40 @@ TouchPad_Config_Version:67
 Silencing it would mean teaching the vendor driver to drive a reset line through an I2C expander.
 Not worth it for a warning that costs nothing.
 
+## ✅ This laptop blanks the display and sleeps in the same second — on battery
+
+Read the power scheme before theorising about what the deck sees when the PC goes away:
+
+```powershell
+powercfg /q SCHEME_CURRENT SUB_SLEEP  | Select-String "Current AC|Current DC"
+powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOIDLE | Select-String "Current AC|Current DC"
+```
+
+|              | Display off | Sleep    |
+|--------------|-------------|----------|
+| **On AC**    | 60 min      | 120 min  |
+| **On battery** | 3 min     | **3 min** |
+
+Both battery values are `0xb4` — 180 seconds. That single fact explains a behaviour that looked
+like a firmware bug for a whole release:
+
+- `GUID_CONSOLE_DISPLAY_STATE` going to 0 is a **display** signal, not a sleep signal. On AC it
+  fires a full hour before the machine sleeps, with the PC wide awake and the link healthy, and
+  the `power` frame delivers perfectly.
+- On battery the two coincide, so by the time the agent is notified the USB bus is already
+  suspended. The agent log shows the deck's last inbound frame landing *one second before* the
+  display-off notification. The frame is written into a dead port every time.
+
+The agent log also shows this signal firing on ordinary screen blanks that end 9–16 seconds later
+— it is genuinely "the screen went off", nothing more. Do not treat it as proof of sleep.
+
+Also worth knowing: **`HIBERNATEIDLE` is 0 on both AC and DC**, so idle hibernation is off and is
+not what cuts power to the deck. If the deck turns out to be dark rather than showing its clock
+after a long sleep, suspect the port being powered down on battery, not hibernation.
+
+The lesson, repeating one from the CH343 saga: two `powercfg` queries would have settled in
+thirty seconds what an afternoon of reading firmware diffs did not.
+
 ## Telling which firmware is on the device
 
 `MD_FW_VERSION` in `config.h` rides along in every `hello`, and the agent prints it on connect:

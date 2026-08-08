@@ -1,5 +1,5 @@
 {
-  "rev": 13,
+  "rev": 14,
   "themes": [
     {
       "name": "Midnight",
@@ -96,8 +96,9 @@
   ],
   "settings": {
     "brightness": 80,
-    "idle_dim_s": 60,
-    "idle_off_s": 300,
+    "idle_dim_s": 120,
+    "idle_off_s": 600,
+    "sleep_clock_s": 20,
     "theme": "Stars",
     "display": "icon_text"
   },

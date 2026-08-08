@@ -143,8 +143,21 @@ struct Theme {
 // percentage and every state sets both knobs.
 struct Settings {
   int brightness = 80;
-  int idle_dim_s = 60;
-  int idle_off_s = 300;
+
+  // Display power, measured from the last touch of the deck. Deliberately unhurried: the deck
+  // is read as often as it is pressed — a calendar or the stats page is used by looking at it —
+  // and a panel that dims while you are still reading it is answering the wrong question.
+  int idle_dim_s = 120;
+  int idle_off_s = 600;
+
+  // How long the deck waits, after the PC goes away *and* you stop touching it, before turning
+  // into a clock. Zero disables the clock entirely.
+  //
+  // This used to ride on idle_off_s, which fused two unrelated ideas: when to save the panel,
+  // and when the PC has gone. That made the clock unreachable in practice — it needed the full
+  // display-off timer to elapse untouched *and* the link to be already down, and on this laptop
+  // those never lined up. Both halves of the condition below use this one number instead.
+  int sleep_clock_s = 20;
 
   // Backlight level while dimmed. Distinct from the overlay: this one starts working the day
   // the backlight gains PWM, without anything else changing.

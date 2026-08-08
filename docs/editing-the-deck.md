@@ -97,8 +97,9 @@ to show something specific before the agent ever connects.
 "settings": {
   "theme":      "Midnight",     // which one to start on; omit for the first
   "brightness": 80,             // 0-100, applied on reload
-  "idle_dim_s": 60,             // dim after this many idle seconds; 0 to never dim
-  "idle_off_s": 300,            // screen off after this many; 0 to never switch off
+  "idle_dim_s": 120,            // dim after this many untouched seconds; 0 to never dim
+  "idle_off_s": 600,            // screen off after this many; 0 to never switch off
+  "sleep_clock_s": 20,          // show the clock this long after the PC goes; 0 to never
   "dim_pct":    15              // backlight level while dimmed
 }
 ```
@@ -106,6 +107,23 @@ to show something specific before the agent ever connects.
 **Every field is optional.** An absent one keeps its default rather than being coerced — including
 `"bg": "#000000"`, which is a real black and not a parse failure. Colours are six-digit hex, `#`
 optional; anything else is rejected and the default kept.
+
+#### The two idle timers are not the same idea
+
+`idle_dim_s` and `idle_off_s` are **display power**, counted from the last time you touched the
+deck. They are unhurried on purpose: the deck gets read as much as it gets pressed, and a panel
+that dims while you are still looking at the calendar is answering the wrong question.
+
+`sleep_clock_s` is about **the PC**, not the panel. The clock appears once the link has been gone
+that long *and* you have not touched the deck for that long — one number, both halves, because
+together they mean "the PC went away and you are not using the deck right now". The touch half is
+what lets the ten-key and theme switching stay usable with the agent closed, instead of a clock
+dropping on top of them.
+
+These used to be one setting, and that was a mistake: the clock could not appear until the
+display-off timer had elapsed untouched, so on a laptop that sleeps and blanks at the same moment
+it never appeared at all. If you want the clock sooner or later, change `sleep_clock_s` and leave
+the other two alone.
 
 Edit, save, tray reload — the whole screen restyles in place. Nothing needs a reflash.
 

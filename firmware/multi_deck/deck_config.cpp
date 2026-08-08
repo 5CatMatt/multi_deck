@@ -224,8 +224,9 @@ bool DeckConfig::parse(JsonObjectConst root) {
 
   JsonObjectConst s = root["settings"];
   settings.brightness = s["brightness"] | 80;
-  settings.idle_dim_s = s["idle_dim_s"] | 60;
-  settings.idle_off_s = s["idle_off_s"] | 300;
+  settings.idle_dim_s = s["idle_dim_s"] | 120;
+  settings.idle_off_s = s["idle_off_s"] | 600;
+  settings.sleep_clock_s = s["sleep_clock_s"] | 20;
   settings.dim_pct = s["dim_pct"] | 15;
   settings.theme_name = String(s["theme"] | "");
   settings.display = tileDisplayFromString(s["display"], TileDisplay::IconText);

@@ -187,11 +187,16 @@ device sits on a desk beside the laptop it drives.
 - **Nord Medium 10/12/26/30/42/44** are unconverted. Only 14/20/28/40 have a same-size Montserrat
   to fall back on, which matters because Nord has no space glyph.
 - **Geoform Bold** exists only as a 72 px VLW — too large for anything in this UI.
-- **Three settings are parsed but never used.** `MD_LONG_PRESS_MS` (600),
-  `MD_KEY_REPEAT_DELAY_MS` (400) and `MD_KEY_REPEAT_RATE_MS` (60) in `config.h` are dead. The
-  real values are LVGL's indev defaults — **400 ms** to hold and 100 ms between repeats —
-  because nothing calls `lv_indev_set_long_press_time()`. Wire them up or delete them; right now
-  they document timings that are not in force.
+- ~~**Three settings are parsed but never used.**~~ Fixed in 0.6.1. `lvgl_port::begin()` now calls
+  `lv_indev_set_long_press_time()` and `lv_indev_set_long_press_repeat_time()`, so `config.h` is
+  in force rather than describing LVGL's defaults.
+
+  `MD_KEY_REPEAT_DELAY_MS` was **deleted rather than wired up**: LVGL has a single
+  `long_press_time` per input device that starts both the `hold` action and the first repeat, so
+  a separate "delay before repeat starts" was never implementable and only looked like a knob.
+  `MD_LONG_PRESS_MS` was left at LVGL's 400 ms, which is what the deck had actually been doing —
+  making the constants live should not silently change how the hardware feels. Only the repeat
+  interval changed, 100 ms → the 60 ms this file always claimed.
 
   (`settings.idle_off_s` was the fourth. It now switches the backlight off, which is the one
   thing the backlight can genuinely do.)

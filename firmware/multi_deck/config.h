@@ -8,7 +8,7 @@
 // Bump this with any behavioural firmware change. It rides along in the `hello` frame and the
 // agent logs it on connect, so "which build is actually on the device?" is answered by looking
 // rather than by remembering.
-#define MD_FW_VERSION    "0.6.0"
+#define MD_FW_VERSION    "0.6.1"
 #define MD_DEVICE_NAME   "multi_deck"
 #define MD_PROTO_VERSION 1
 
@@ -215,9 +215,22 @@ static constexpr uint32_t MD_CDC_TX_TIMEOUT_MS = 20;
 // ---------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------
-static constexpr uint32_t MD_LONG_PRESS_MS       = 600;
-static constexpr uint32_t MD_KEY_REPEAT_DELAY_MS = 400;  // hold before repeat starts
-static constexpr uint32_t MD_KEY_REPEAT_RATE_MS  = 60;   // interval once repeating
+// These are applied to the touch input device in lvgl_port::begin(). They were declared here
+// for a long time and read by nothing, so the deck ran on LVGL's defaults (400ms / 100ms) while
+// this file claimed otherwise — editing them appeared to do nothing, which is a worse failure
+// than a bad value.
+//
+// One threshold, two uses, because that is how LVGL works: a single long_press_time per input
+// device starts both the LV_EVENT_LONG_PRESSED that fires a tile's `hold` action and the first
+// LV_EVENT_LONG_PRESSED_REPEAT that drives ten-key auto-repeat. There is no separate
+// "delay before repeat" to set, so the constant that used to claim there was is gone rather
+// than quietly ignored.
+//
+// Left at LVGL's 400ms on purpose: that is what the deck has actually been doing all along, so
+// plumbing these in does not change how holding a tile feels. Only the repeat interval changes,
+// from 100ms to the 60ms this file always meant.
+static constexpr uint32_t MD_LONG_PRESS_MS      = 400;  // hold to fire `hold`; also starts repeat
+static constexpr uint32_t MD_KEY_REPEAT_RATE_MS = 60;   // interval once repeating
 
 // ---------------------------------------------------------------------------
 // Debug logging

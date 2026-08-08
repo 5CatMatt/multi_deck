@@ -202,10 +202,38 @@ class DeckConfig:
                 f"(have: {', '.join(sorted(theme_names)) or 'none'})"
             )
 
+        self._validate_timings(settings, problems)
+
         self._validate_themes(problems)
 
         if problems:
             raise ConfigError("deck.json problems:\n  " + "\n  ".join(problems))
+
+    # Seconds-valued settings, and the smallest value that is not simply "off". ArduinoJson's
+    # `| default` yields the default for a wrong *type*, so a string here reads as an edit that
+    # never arrived — the same silent class of failure as the theme fields below.
+    TIMING_SETTINGS = ("idle_dim_s", "idle_off_s", "sleep_clock_s")
+
+    def _validate_timings(self, settings: dict, problems: list[str]) -> None:
+        for key in self.TIMING_SETTINGS:
+            value = settings.get(key)
+            if value is None:
+                continue
+            # bool is an int subclass, and `true` here is a mistake worth naming.
+            if isinstance(value, bool) or not isinstance(value, int):
+                problems.append(f"settings.{key} is {value!r}, expected a whole number of seconds")
+            elif value < 0:
+                problems.append(f"settings.{key} is {value}, expected 0 (off) or more")
+
+        dim = settings.get("idle_dim_s")
+        off = settings.get("idle_off_s")
+        if isinstance(dim, int) and isinstance(off, int) and 0 < off < dim:
+            # Not fatal — the firmware tests Off first precisely so this still reaches Off — but
+            # it means the dim stage never appears, which is rarely what someone meant to write.
+            problems.append(
+                f"settings.idle_off_s ({off}) is below idle_dim_s ({dim}), "
+                "so the screen goes off without ever dimming"
+            )
 
     def _validate_themes(self, problems: list[str]) -> None:
         """Rejects theme values the firmware would silently ignore.

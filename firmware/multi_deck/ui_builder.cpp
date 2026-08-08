@@ -36,6 +36,10 @@ lv_obj_t *g_toast = nullptr;
 
 String g_current_page;
 bool g_link_up = false;
+
+// When the link last went away. Zero is not a special case: at boot the link is down and
+// millis() - 0 is simply how long it has been down for, which is the right answer.
+uint32_t g_link_down_since_ms = 0;
 uint32_t g_toast_until = 0;
 uint8_t g_brightness = 80;
 
@@ -656,6 +660,8 @@ void setLinkUp(bool up) {
   if (up == g_link_up) return;
   g_link_up = up;
 
+  if (!up) g_link_down_since_ms = millis();
+
   // A new session means the PC is demonstrably awake, whatever it said last. This is what
   // stops an agent quitting mid-sleep from stranding the deck on its clock forever: the state
   // is cleared by evidence, not only by the frame that is supposed to clear it.
@@ -768,20 +774,35 @@ void tick() {
   // out not to matter here: the alternative in every one of those cases is a black screen, and a
   // clock beats a black screen in all of them. It stays a deliberate announcement for entering
   // *early* — the difference is that this no longer needs one to happen at all.
-  if (wanted == Idle::Off && !g_link_up) {
-    if (device_time::valid()) {
-      enterSleep();
-      return;
-    }
+  //
+  // This used to hang off `wanted == Idle::Off`, and that coupling is what made the feature
+  // unreachable: the clock could not appear until the display-power timer had elapsed untouched,
+  // which had nothing to do with whether the PC was there. Both conditions below are the same
+  // knob now, because together they are a single idea — the PC has gone away, and you are not
+  // using the deck right now. The touch half is what keeps the ten-key and theme switching
+  // usable with the agent closed, instead of a clock landing on top of them.
+  if (!g_link_up && settings.sleep_clock_s > 0) {
+    const uint32_t wait_ms = (uint32_t)settings.sleep_clock_s * 1000UL;
 
-    // Reaching the off stage with no clock to show is worth saying once, because from the front
-    // of the device it is indistinguishable from the feature not existing. It means no `time`
-    // frame has arrived since power-up — the deck has no RTC, so a deck that has never seen the
-    // agent genuinely cannot show a clock.
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      MD_LOG.println("[ui] would show the sleep clock, but no time sync has arrived yet");
+    // Unsigned subtraction, so the 49.7-day millis() rollover comes out as a small number
+    // rather than seven weeks of "away".
+    const uint32_t away_ms = millis() - g_link_down_since_ms;
+
+    if (away_ms > wait_ms && idle_ms > wait_ms) {
+      if (device_time::valid()) {
+        enterSleep();
+        return;
+      }
+
+      // Being due a clock with none to show is worth saying once, because from the front of the
+      // device it is indistinguishable from the feature not existing. It means no `time` frame
+      // has arrived since power-up — the deck has no RTC, so a deck that has never seen the
+      // agent genuinely cannot show a clock.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        MD_LOG.println("[ui] would show the sleep clock, but no time sync has arrived yet");
+      }
     }
   }
 

@@ -89,9 +89,9 @@ tiles show an icon, a label, or both.
 
 ### Screen and messages
 
-The screen **dims after 60 seconds** of no touch and **switches off after 5 minutes**. Touching
-it brings it straight back, and that first touch only wakes — it does not also press whatever
-tile was under your finger.
+The screen **dims after 2 minutes** of no touch and **switches off after 10**. Touching it brings
+it straight back, and that first touch only wakes — it does not also press whatever tile was
+under your finger.
 
 Dimming is drawn rather than driven: the backlight on this board is a plain on/off line with no
 brightness control, so the deck darkens by drawing over itself. Switching off at 5 minutes is
@@ -107,11 +107,18 @@ appear at the bottom of the screen for about 2.5 seconds.
 The deck notices, and turns into a clock: large, dark, and readable across a room at night
 without lighting one. Touch it to get the deck back — the PC stays asleep.
 
-It gets there two ways. The agent announces the sleep if it can, which is instant. Failing that
-— and on a Modern Standby laptop it usually does fail, because the machine freezes the agent in
-the same second it dims the display — the deck shows the clock at the point it would otherwise
-have switched the screen off. So a closed agent or an unplugged cable eventually gets you a
-clock too, which beats the black screen that was there before.
+It gets there two ways. The agent announces the sleep if it can, which is instant. On a Modern
+Standby laptop that announcement usually does not make it — on battery this machine blanks the
+display and suspends the USB bus in the same second, so the frame is written into a port that is
+already gone. So the deck also decides for itself: **20 seconds** after the link drops, if it has
+not been touched in that time either, it shows the clock. A closed agent or an unplugged cable
+gets you a clock too, which beats the black screen that was there before.
+
+That 20 seconds is `sleep_clock_s`, and it is deliberately separate from the dim and off timers
+above. Those are about saving the panel; this one is about the PC being gone. Fusing them — which
+is how it worked first — meant the clock could not appear until a five-minute display timer ran
+out untouched, and in practice that never happened, so the feature was invisible for its whole
+first release.
 
 The deck has no battery-backed clock, so it learns the time from the PC on connect and once a
 minute after. Until the first sync it says so rather than showing a wrong time.

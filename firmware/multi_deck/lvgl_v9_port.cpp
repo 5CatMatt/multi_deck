@@ -76,6 +76,11 @@ bool begin() {
   lv_indev_set_read_cb(g_touch_indev, touchReadCallback);
   lv_indev_set_display(g_touch_indev, g_display);
 
+  // Without these two calls the constants in config.h are decorative and LVGL's own defaults
+  // apply. See the comment there for why one threshold covers both holds and ten-key repeat.
+  lv_indev_set_long_press_time(g_touch_indev, MD_LONG_PRESS_MS);
+  lv_indev_set_long_press_repeat_time(g_touch_indev, MD_KEY_REPEAT_RATE_MS);
+
   MD_LOG.printf("[lvgl] up, 2 x %u byte draw buffers in PSRAM\n",
                 static_cast<unsigned>(buf_bytes));
   return true;

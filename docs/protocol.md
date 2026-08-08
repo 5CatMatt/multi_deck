@@ -169,13 +169,22 @@ agent gets no margin, its event loop is already being frozen, and the frame neve
 first real sleep test showed the deck running its ordinary idle sequence, having been told
 nothing.
 
-So the device now **also** enters the sleep screen when it would otherwise switch the backlight
-off with the link down. The ambiguity turned out not to matter: the alternative in every one of
-those cases is a black screen, and a clock beats a black screen in all of them. The frame still
-earns its place by making it *immediate* rather than waiting out `idle_off_s`.
+So the device **also** enters the sleep screen on its own, `settings.sleep_clock_s` after the link
+goes down (default 20s, and it must have gone untouched for that long too). The ambiguity turned
+out not to matter: a closed agent, a sleeping PC and an unplugged cable all otherwise end in a
+black screen, and a clock beats a black screen in all of them. The frame still earns its place by
+making it *immediate* when it does arrive.
+
+That fallback was first written as "when the backlight would switch off anyway with the link
+down", which tied it to `idle_off_s`. On this laptop that made the clock unreachable in ordinary
+use — it needed five untouched minutes *and* a dead link, and the two never lined up — so the two
+timers are now independent. Details in `editing-the-deck.md`.
 
 The Windows trigger is `GUID_CONSOLE_DISPLAY_STATE` rather than `PBT_APMSUSPEND`, which is later
-still. Recovering the link afterwards is a separate matter — see below.
+still. Note that it is genuinely a *display* signal, not a sleep signal: on AC, where the display
+blanks an hour before the machine sleeps, it fires — and delivers — with the PC wide awake. On
+battery, where both timers are 3 minutes here, the bus is already gone. Recovering the link
+afterwards is a separate matter — see below.
 
 ### `stats` frame
 
@@ -249,7 +258,7 @@ Lives at the root of the SD card. The agent holds the master copy and can push i
       "text": "#e6edf3", "text_muted": "#8b949e", "ok": "#3fb950", "idle": "#6e7681",
       "tile_opa": 100, "border": "#8fa6c0", "border_opa": 22, "radius": 14 }
   ],
-  "settings": { "theme": "Midnight", "brightness": 80, "idle_dim_s": 60, "idle_off_s": 300 },
+  "settings": { "theme": "Midnight", "brightness": 80, "idle_dim_s": 120, "idle_off_s": 600 },
   "pages": [
     {
       "id": "launch",
