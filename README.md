@@ -244,8 +244,26 @@ Linker warnings about `missing .note.GNU-stack section` are toolchain noise and 
 
 Two USB cables during development, and this is intentional rather than a workaround:
 
-- **Port A** (marked `USB TO UART`, behind the CH343P bridge) — flashing and the `Serial` debug log.
-- **Port B** (the plain `USB` port, native ESP32-S3 USB) — the composite HID + CDC device the PC sees.
+- **Port A** (marked `USB TO UART`, behind the CH343P bridge) — the `Serial` debug log, and the
+  reset lines: `RTS` drives `EN`, `DTR` drives `IO0`.
+- **Port B** (the plain `USB` port, native ESP32-S3 USB) — the composite HID + CDC device the PC
+  sees, and **the flashing path**.
 
 Because they are separate, the device can be debugged over the serial log *while* it is acting as a
-keyboard. In daily use only port B is plugged in.
+keyboard. **In daily use only port B is plugged in** — it carries power, HID and the agent link on
+its own, and a second cable to the same laptop just puts a second VBUS source on the rail and
+another device on the same host controller for no benefit.
+
+To flash:
+
+```powershell
+python tools/flash.py
+```
+
+That builds, resets the board into download mode over port A, writes the image over **port B**,
+resets it back, tails the boot log, and stops and restarts the agent around it.
+
+Flashing deliberately does *not* go through port A. The CH343 was observed dropping off the USB
+bus partway through five consecutive 1.1MB writes, at three different baud rates, while few-KB
+images wrote fine every time — so port A now only ever carries the reset pulse, which is a few
+microseconds of pin toggling. See [docs/hardware-notes.md](docs/hardware-notes.md).

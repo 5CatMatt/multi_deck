@@ -13,3 +13,4 @@ sdcard/icons/*.bin
 build/
 *.elf
 *.bin.hex
+build/

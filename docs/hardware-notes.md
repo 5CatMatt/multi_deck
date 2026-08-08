@@ -276,6 +276,16 @@ separate COM port, plus a "USB JTAG/serial debug unit" device. That is native US
 chip in the path, so there is simply less to fail. It wrote the whole app and verified in **7
 seconds, first attempt**, having failed five times over port A.
 
+**[tools/flash.py](../tools/flash.py) does all of this in one command** — build, download mode,
+flash, reset, tail the log, with the agent stopped and restarted around it:
+
+```powershell
+python tools/flash.py
+```
+
+The rest of this section is what it does and why, for when it needs changing or the board does
+something new.
+
 It is a three-step procedure, because the JTAG port only exists while the app is stopped and
 `esptool` cannot reset the board through it. **Port A drives the reset; port B carries the data.**
 
