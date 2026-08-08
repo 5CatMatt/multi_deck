@@ -105,15 +105,25 @@ void ensureDimOverlay() {
   lv_obj_add_event_cb(g_dim_overlay, onDimOverlayClick, LV_EVENT_CLICKED, nullptr);
 }
 
-// `veil` is 0-100. `absorb_touch` decides whether the overlay is a filter you can press
-// through or a lid you have to lift first.
+// `veil` is 0-100. `absorb_touch` decides whether the first touch wakes the deck without also
+// pressing whatever is underneath.
+//
+// The two are independent, and keeping them so is the whole point now that the backlight is
+// real. On a rewired board `dim_opa` is 0 and this draws nothing at all — but the shield is
+// still wanted, because "the tap that woke the screen should not also fire a macro" has nothing
+// to do with how the screen was darkened. Gating the overlay's existence on the veil, which is
+// what this used to do, silently removed that protection the moment the veil went to zero.
 void setDimOverlay(uint8_t veil, bool absorb_touch) {
-  if (veil == 0 && g_dim_overlay == nullptr) return;
+  // Nothing wanted and nothing built. The resting case, and the one that must cost nothing.
+  if (veil == 0 && !absorb_touch && g_dim_overlay == nullptr) return;
 
   ensureDimOverlay();
   lv_obj_set_style_bg_opa(g_dim_overlay, veil * 255 / 100, 0);
 
-  if (veil == 0) {
+  // Hidden objects receive no input, so this may only hide when the shield is not wanted either.
+  // A zero-opacity background is skipped by the renderer, so an unhidden but transparent overlay
+  // costs nothing to draw and still catches the touch.
+  if (veil == 0 && !absorb_touch) {
     lv_obj_add_flag(g_dim_overlay, LV_OBJ_FLAG_HIDDEN);
   } else {
     lv_obj_remove_flag(g_dim_overlay, LV_OBJ_FLAG_HIDDEN);
@@ -144,28 +154,35 @@ void applyIdle() {
 
   switch (g_idle) {
     case Idle::Awake:
-      // No veil at rest, deliberately.
+      // No veil and no shield at rest — nothing is drawn over the deck and nothing intercepts a
+      // tap. `brightness` reaches the panel through setBacklight() below and, since the rewire,
+      // means what it says.
       //
-      // This briefly painted `100 - brightness` here so that `brightness` would have a visible
-      // effect before the backlight is rewired for PWM. That was wrong: brightness had never
-      // done anything, so every existing theme suddenly went 20% darker on flashing, and on a
-      // near-black theme like Stars (#060A12 under a dark wallpaper) the panel read as simply
-      // off. Making a dead setting live is not worth changing how every deck already looks.
-      //
-      // `brightness` still goes to setBacklight() below, where it becomes real the day the
-      // backlight moves to a GPIO. The overlay's job is the idle stages, and only those.
+      // This briefly painted `100 - brightness` here so that `brightness` would have some
+      // visible effect before the backlight could dim for real. That was wrong: brightness had
+      // never done anything, so every existing theme suddenly went 20% darker on flashing, and
+      // on a near-black theme like Stars (#060A12 under a dark wallpaper) the panel read as
+      // simply off. Making a dead setting live is not worth changing how every deck looks.
       break;
 
     case Idle::Dimmed:
       backlight = clampPercent(settings.dim_pct);
       veil = theme::current().dim_opa;
-      absorb_touch = true;
+
+      // Deliberately *not* absorbing. The tiles are still legible at this stage, so a tap here
+      // is aimed at something — swallowing it to "wake first" reads as the deck being slow or
+      // broken, because from the front nothing happened. The press fires and the next tick()
+      // takes the brightness back up, so it wakes as a side effect of being used.
+      //
+      // The shield earns its place at Off and behind the sleep clock, where there is nothing to
+      // aim at and any tap is a request to see the deck rather than to press a particular tile.
       break;
 
     case Idle::Off:
-      // The one thing the expander-driven backlight genuinely does. The veil stays set so that
-      // waking does not flash a bright screen for a frame before the overlay catches up.
       backlight = 0;
+      // Still asked for, even though a real backlight at 0 has nothing left to darken. It is
+      // free when `dim_opa` is 0, and on a board that has not been rewired it is the only thing
+      // that makes waking from Off not flash a bright frame first.
       veil = theme::current().dim_opa;
       absorb_touch = true;
       break;

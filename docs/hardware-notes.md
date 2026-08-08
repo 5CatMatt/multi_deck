@@ -36,12 +36,18 @@ tractable.
 
 | Pin | Function | Notes |
 |---|---|---|
-| EXIO1 | `TP_RST` | Touch panel reset |
-| EXIO2 | `DISP` | LCD backlight enable |
+| EXIO1 | `TP_RST` | Touch panel reset — via R22 (100R) |
+| EXIO2 | `DISP` | Panel display enable **and** backlight — via R21 (100R). See the backlight section; this one net does two jobs. |
+| EXIO3 | `LCD_RST` | **R20 is unpopulated from the factory** — this line is open and reaches nothing. Confirmed on the board, 2026-08-08. |
 | EXIO4 | `SD_CS` | SD card chip select — see gotcha below |
 | EXIO5 | `USB_SEL` | Selects USB vs CAN on the FSUSB42UMX — see gotcha below |
 
-EXIO0, EXIO3, EXIO6, EXIO7 are not documented as assigned.
+EXIO0, EXIO6, EXIO7 are not documented as assigned.
+
+Each EXIO leaves the expander through its own 100R series resistor (R18–R22), which is what makes
+the backlight mod a resistor removal rather than a trace cut. **R20 being a no-fit matters when
+diagnosing a blank panel:** `LCD_RST` cannot be the cause, because the expander was never
+connected to it.
 
 ## ⚠️ Open questions for Phase 0
 
@@ -377,7 +383,29 @@ Drop `-PresentOnly` and you get every device the machine has ever seen, which is
 ghost entries all read `Status: Unknown` and will happily show you a COM port that has not existed
 for months.
 
-## ⚠️ The backlight is on/off only — until it is rewired
+## ✅ The backlight is on/off only — until it is rewired (done, 2026-08-08)
+
+**Completed on this board.** `MD_BACKLIGHT_PWM_GPIO 16`, EN measured at 1.26 V for 80% with DISP
+holding a steady 3.3 V, and the panel tracks the percentage smoothly. Everything below is the
+record of how, including two reworks that did not succeed and why.
+
+**Swept 4–100% in 26 steps, both directions, and every default held:**
+
+| Result | Confirms |
+|---|---|
+| Response is **linear** across the whole range | The EN-window mapping is right. A raw duty map would have given a dead zone below 21% and a cliff between 21 and 42. |
+| **Still legible at 4%** (EN 728 mV) | `MD_BACKLIGHT_EN_MIN_MV 700` sits just above the converter's real cutoff, and `MD_BACKLIGHT_MIN_PCT 4` is a floor that still produces light. |
+| **100 clearly brighter than 80** | `MD_BACKLIGHT_EN_MAX_MV 1400` is not past saturation; the top of the scale is doing work. |
+| **No flicker at any level** | 20 kHz is far enough above the 159 Hz corner that no ripple survives the filter. |
+
+So the datasheet numbers survived contact with the board unmodified — unusual enough to be worth
+saying. The one thing the sweep suggests for later: the sleep clock shares `dim_pct` with the idle
+dim, and 4% being visible means a night clock could sit well below a dim level that still has to
+be usable. Splitting those is a future change, not a fix.
+
+The short version for anyone repeating it: **remove R10**, wire the GPIO through a 1k to R10's
+EN-side pad, and leave R21 and R4 alone. Do not try to cut the DISP net — see below.
+
 
 `settings.brightness` did nothing for the project's first five months, and the README described a
 dim-to-10% behaviour that could not happen. Not a bug in our code: the board profile
@@ -399,20 +427,84 @@ percentage is identical**; only `setBacklight(0)` does anything.
 
 **This is a wiring limitation, not a permanent one, and the firmware side is already written.**
 
+### ✅ What the schematic actually says (settled 2026-08-08)
+
+Three facts, and all three changed the plan:
+
+**1. There is nothing to cut.** Every EXIO line leaves the CH422G through a 100R series
+resistor — R18/R19 on IO4/IO5, R20 on IO3, **R21 on IO2**, R22 on IO1. Removing R21 isolates the
+expander from the DISP net completely. No scalpel, no lifted pad, and it solders straight back.
+
+**2. DISP is not an on/off line — it is an analogue dimming input.** It goes through R10 (1k) to
+the **EN pin of an MP3302 LED boost converter**, with C12 (1uF) to ground. That RC has a corner
+at about **159 Hz**, so EN never sees a square wave; it sees the DC average. The datasheet:
+
+> Apply a 200Hz to 1kHz square waveform to the EN pin to implement PWM dimming […] For high
+> frequency PWM dimming (>1kHz), it is also recommended that the dimming control be implemented
+> as shown in Figure 3 […] The DC voltage on EN pin is then equal to the PWM high level voltage
+> multiplied by the PWM duty. The DC voltage from **0.7V to 1.4V** programs the output current
+> from 0~100%.
+
+Figure 3's filter is already fitted. This board was built for high-frequency dimming.
+
+**3. EXIO2 also drives nothing else.** The pin table lists it as `DISP` alone.
+
+There is also **R4, a 10K pull-up to 3V3 on the DISP net**, which is a useful safety property: a
+floating GPIO leaves the backlight *on*, not dark.
+
+### ⚠️ DISP is two signals on one net — this is the trap
+
+**`DISP` is not a backlight enable. It is also `PORT1` pin 31, the LCD panel's own display
+enable.** The net fans out three ways:
+
+```
+CH422G IO2 ─R21─┬─ LCD PORT1 pin 31      panel display enable
+                ├─ R4 10K to 3V3          pull-up
+                └─ R10 1k ─┬─ C12 ─ GND   the RC filter
+                           └─ MP3302 EN   backlight brightness
+```
+
+Drive PWM onto that net and you dim the backlight *and* chop the panel's display enable at the
+PWM rate. At a 21–42% duty the panel is told "off" most of the time and blanks completely —
+while the backlight, which averages through R10/C12, dims perfectly.
+
+The symptom is unmistakable once you know it: **black screen, correct dimming, working touch,
+tiles that still fire when tapped.** The firmware is fine and the boot log says so; LVGL is
+rendering into a panel that is not displaying.
+
+So the PWM must go on the **backlight branch only**, after the split — not on the shared net.
+
 ### Doing the rewire
 
-1. **Move the backlight enable** from CH422G EXIO2 to **GPIO15 or GPIO16**. Those are the only
-   free candidates: GPIO6 is spoken for as `MD_SD_CS_PLACEHOLDER`, and everything else is panel,
-   flash (26–32) or octal PSRAM (33–37). Check the Waveshare schematic first — whether the
-   driver's enable input tolerates PWM at all, and whether EXIO2 gates anything besides the
-   backlight, decides where the trace comes off.
-2. **Uncomment one line** in `config.h`:
+1. **Leave R21 and R4 in place.** The CH422G keeps driving `DISP` and R4 keeps pulling it up,
+   which together hold the *panel* enabled. `board_port::begin()` drives EXIO2 high whenever
+   `MD_BACKLIGHT_PWM_GPIO` is defined, so that line is load-bearing rather than incidental.
+2. **Remove R10 completely.** It is the only component bridging the DISP node and the EN node, so
+   taking it off isolates them unconditionally — whatever the copper does underneath.
+3. **Solder the GPIO to R10's EN-side pad through a 1k** (R10 itself will do). The path is then
+   `GPIO ─ 1k ─ C12 ─ MP3302 EN`, with the datasheet's filter intact. Never connect the GPIO to
+   that node directly: it would drive 1µF with no series resistance and hand EN a raw square wave.
+
+**Do not try to cut the DISP net.** Two attempts failed here. The trace to LCD pin 31 runs through
+a via under a passive and is not visible, so a cut that looks complete leaves the nodes joined —
+and the obvious continuity check (GPIO-to-R10) passes while the one that matters still shorts. The
+tell is measuring DISP and EN and getting the *same* number; they must differ. Removing a
+component is verifiable by inspection, which is why step 2 is a removal.
+4. **Uncomment one line** in `config.h`:
    ```c
-   #define MD_BACKLIGHT_PWM_GPIO 15
+   #define MD_BACKLIGHT_PWM_GPIO 16
    ```
-3. Flash. That is the entire software change — `board_port::setBacklight()` already has the LEDC
+5. Flash. That is the entire software change — `board_port::setBacklight()` already has the LEDC
    branch, and everything above it passes percentages rather than booleans, so nothing else knew
    the number was being discarded and nothing else needs telling that it no longer is.
+
+Afterwards the two signals are properly separate: the panel's display enable is a static high
+from the expander, and the backlight is a control voltage from the GPIO. `setBacklight(0)` takes
+EN below threshold and stops the converter without disabling the panel.
+
+**Do not inject onto the shared DISP net** — that is the mistake described above, and it produces
+a black screen that dims convincingly. If R21 has already been removed, put it back; a net held
+up only by R4's 10K works, but nothing is then actively driving the panel's enable.
 
 The pin choice is guarded at compile time, verified by building against each bad case:
 
@@ -422,18 +514,96 @@ The pin choice is guarded at compile time, verified by building against each bad
 | 6 | `MD_BACKLIGHT_PWM_GPIO collides with MD_SD_CS_PLACEHOLDER` |
 | 30 | `GPIO26-32 are flash and GPIO33-37 are octal PSRAM…` |
 
-Do not define the macro before doing the mod: it stops driving EXIO2, so the panel goes dark.
+Defining the macro before doing the mod is harmless — `begin()` still drives EXIO2 high, so the
+panel sits at full brightness and the PWM goes to an unconnected pin. It looks like the mod
+failing rather than like the mod not having happened, which is worth knowing before you go
+hunting.
 
-**`MD_BACKLIGHT_PWM_HZ` defaults to 1000, deliberately low, and is the first thing to change if
-the panel misbehaves.** If the rewired line feeds a boost converter's *enable* pin rather than a
-dedicated dimming input, it must restart the converter every cycle and only low frequencies
-work — too high and the backlight stays dark or flickers. If it feeds a real PWM input, raise it
-to 20000 to put the switching above hearing; some backlight inductors sing at 1–5 kHz, which is
-quiet but maddening at a desk. **Sweep `brightness` across its range afterwards and listen as
-well as look.**
+### ⚠️ Free pins are scarcer than they look
+
+The vendor board profile only lists what *it* drives, and the panel/USB pin table only covers the
+panel and USB. Both leave GPIO15 and GPIO16 blank. **They are the RS485 transceiver**, and that
+omission nearly put the backlight on one of them.
+
+The honest accounting for this board:
+
+| GPIO | Status |
+|---|---|
+| **6** | **Sensor header J6 pin 3 (`AD`).** Otherwise idle. |
+| **15, 16** | **RS485 transceiver.** Blank in the pin table; not free. |
+| 33–37 | **Octal PSRAM** on an N8R8 with `PSRAM=opi`. Costs the LVGL draw buffers — i.e. the display. |
+| 26–32 | Flash. |
+| 11, 12, 13 | SD SPI (ours). |
+| 43, 44 | UART0 — the `MD_LOG` debug channel on port A. How this board gets debugged at all. |
+| 8, 9 | I2C: touch and the CH422G. |
+| 19, 20 | Native USB, port B. |
+| 4 | `CTP_IRQ`, an output from the GT911. |
+
+**There is no free pin — only a choice of what to give up. Take GPIO16.**
+
+The RS485 sheet is the thing that settles it, and the two RS485 pins are not equivalent:
+
+| Pin | Net | What it actually touches | Verdict |
+|---|---|---|---|
+| **16** | `RS485_RXD` | R68 (4.7k) into S1's base; R67 (4.7k) pull-up. **Nothing drives it.** | ✅ **no cut** |
+| 15 | `RS485_TXD` | The SP3485's **`RO` output**. R64 is a pull-up, not a series resistor. | ❌ needs a cut |
+
+`DI` is tied to GND and `DE`/`RE̅` are driven from S1's collector, so the ESP transmits by
+modulating the driver enable — which means **GPIO16 is already an output in normal use**, and
+repurposing it as PWM is doing what it already did. The load is ~0.7mA fighting R67 plus ~0.55mA
+into the base. Tap it at the R67/R68 pad on the IO16 side.
+
+The only side effect is that the SP3485's `DE` now follows the PWM, so the transceiver enables and
+disables at 20kHz with `DI` low. With nothing plugged into J1/J2 that drives only the 10k bias
+network — microamps, and the part is rated for 10 Mbps. Removing R68 would isolate it completely,
+but it is not worth the extra rework: with R68 gone the base floats, R66 pulls `DE` permanently
+high, and the driver sits enabled instead. Chattering into nothing is the quieter of the two.
+
+**GPIO6 remains the fallback** if RS485 is wanted and the sensor header is not. Physically it is
+the easiest tap of all — a through-hole header pin rather than a chip pad — but it costs the
+sensor header *and* a software change: `MD_SD_CS_PLACEHOLDER` sits on GPIO6, and while the card
+ignores that pin (its real chip select is EXIO4, asserted once and left asserted), `SPI.begin()`
+and `SD.begin()` still configure it as an output and toggle it per transaction, which would fight
+the PWM. The `static_assert` refuses the collision if this is forgotten.
+
+The DISP end of the jumper is identical whichever pin is chosen: R21 off, wire from its net-side
+pad.
+
+### ⚠️ Duty is a control voltage, not a brightness
+
+This is the part that would have looked like a broken mod. With a 3.3 V swing, the datasheet's
+0.7–1.4 V window is only **21% to 42% duty**. Mapping `brightness` linearly onto 0–100% duty —
+which is what the firmware did before the schematic was read — gives:
+
+| `brightness` | Result |
+|---|---|
+| below ~21 | dark, converter under threshold |
+| 21 – 42 | the *entire* usable range, as a cliff |
+| above 42 | saturated, no further change |
+
+So `setBacklight()` maps the percentage into the voltage window instead, via
+`MD_BACKLIGHT_EN_MIN_MV` (700) and `MD_BACKLIGHT_EN_MAX_MV` (1400). They are in millivolts
+because that is the form the datasheet states and the form a multimeter on the EN side of R10
+reports — **if a sweep saturates early or never quite reaches full, trim those two rather than
+the mapping code.** Each level logs its own arithmetic:
+
+```
+[board] backlight 40% via LEDC on GPIO15 (EN 980 mV, duty 303/1023)
+```
+
+**`MD_BACKLIGHT_PWM_HZ` is now 20000.** The datasheet wants the filter corner ten times below the
+PWM frequency; R10/C12 put that corner at ~159 Hz, so the floor is about 1.6 kHz. 20 kHz clears it
+comfortably. The earlier 1000 Hz default was a hedge against DISP feeding a bare enable pin that
+had to restart the converter each cycle — it does not, and 1 kHz would sit only ~6× above the
+corner and let visible ripple through.
+
+Note that there is **no audible-whine risk from the PWM itself here**: the converter runs
+continuously on a DC control voltage rather than being chopped at the dimming rate. Still sweep
+and listen, but the expected failure is ripple, not singing.
 
 `MD_BACKLIGHT_MIN_PCT` (default 4) floors any non-zero request so a low setting reads as dim
-rather than as a dead panel. Zero is still honoured exactly.
+rather than as a dead panel. Zero is honoured exactly, and is the one case that drops duty to a
+true 0% so EN falls below threshold and the converter shuts down rather than idling at minimum.
 
 **So do not write code that assumes brightness is binary.** The UI carries two knobs that
 multiply: the real backlight, always called with a real percentage, and a full-screen

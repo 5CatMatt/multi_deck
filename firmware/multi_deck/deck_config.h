@@ -107,7 +107,17 @@ struct Theme {
 
   // How dark the idle overlay goes, 0-100. A theme token rather than a setting because a pale
   // theme needs a heavier veil than a dark one to read as equally dimmed.
-  uint8_t dim_opa = 55;
+  //
+  // The default depends on the backlight, because the two knobs multiply and this one only
+  // exists to supply darkness the backlight cannot. Once the backlight can, it supplies none:
+  // a real 15% behind a 55% veil is about 7% of full, which on a theme with a #060A12
+  // background is indistinguishable from a dead panel. That is not a hypothetical — it is what
+  // the deck did the first time it dimmed after the rewire.
+  //
+  // Not a branch in any logic: both states still set both knobs, every value is still a
+  // percentage, and this is one number choosing a starting point. Override per theme in
+  // deck.json to taste.
+  uint8_t dim_opa = MD_DIM_OPA_DEFAULT;
 
   bool flip180 = MD_ROTATE_180;
 

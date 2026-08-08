@@ -73,6 +73,13 @@ bool begin() {
   expanderWrite(MD_EXIO_USB_SEL, MD_USB_SEL_USB_LEVEL);
 
 #ifdef MD_BACKLIGHT_PWM_GPIO
+  // Nothing passive holds this line once the mod isolates the backlight branch — R4's 10k stays
+  // with whichever side of the cut it lands on, and the branch the GPIO drives may not be the
+  // one that kept it. LEDC drives the pin from attach onwards, but reset-to-attach is otherwise
+  // undefined, and an undefined EN is an indeterminate backlight. A weak internal pull-up costs
+  // nothing and makes the default "lit", which is the right way round for a boot window.
+  pinMode(MD_BACKLIGHT_PWM_GPIO, INPUT_PULLUP);
+
   // Before ui::begin(), which sets the backlight as soon as the idle state is applied. A
   // ledcWrite() to an unattached pin is silently ignored, so getting this order wrong would look
   // like the mod not working rather than like a missing init.
@@ -84,9 +91,14 @@ bool begin() {
                   MD_BACKLIGHT_PWM_HZ, MD_BACKLIGHT_PWM_BITS);
   }
 
-  // The expander line is no longer wired to anything after the mod, but drive it high anyway:
-  // if the trace was left intact and the GPIO merely paralleled onto it, a low here would fight
-  // the PWM and hold the panel dark.
+  // Load-bearing, not tidiness: DISP is also PORT1 pin 31, the LCD panel's own display enable,
+  // and after the mod this is the only thing still driving it. R21 stays fitted precisely so
+  // that it can be — the PWM is injected further along, at R10, on the backlight branch alone.
+  //
+  // Putting the PWM on the shared net instead chops the panel's display enable at 20kHz. The
+  // backlight dims correctly, because R10/C12 average it; the panel blanks completely, because
+  // it is being told "off" for most of every cycle. Black screen, working touch, clean boot log.
+  // See docs/hardware-notes.md.
   expanderWrite(MD_EXIO_DISP, HIGH);
 #endif
 
@@ -155,14 +167,36 @@ void setBacklight(uint8_t percent) {
   // boolean — the idle machine, the theme, the `backlight` frame — so none of it knew or cared
   // that the number was being thrown away, and none of it needed touching when it stopped being.
   //
-  // Zero is honoured exactly; anything else is floored, so a low setting reads as dim rather
-  // than as a dead panel that sends you looking for a fault.
-  const uint8_t level = (percent == 0) ? 0
-                                       : (percent < MD_BACKLIGHT_MIN_PCT ? MD_BACKLIGHT_MIN_PCT
-                                                                         : percent);
   constexpr uint32_t kMaxDuty = (1u << MD_BACKLIGHT_PWM_BITS) - 1;
-  ledcWrite(MD_BACKLIGHT_PWM_GPIO, static_cast<uint32_t>(level) * kMaxDuty / 100);
-  MD_LOG.printf("[board] backlight %u%% via LEDC on GPIO%d\n", level, MD_BACKLIGHT_PWM_GPIO);
+
+  // Zero is honoured exactly, and it is the one case that wants a real 0% duty: EN below its
+  // threshold shuts the boost converter down rather than running it at minimum current.
+  if (percent == 0) {
+    ledcWrite(MD_BACKLIGHT_PWM_GPIO, 0);
+    MD_LOG.printf("[board] backlight off via LEDC on GPIO%d\n", MD_BACKLIGHT_PWM_GPIO);
+    return;
+  }
+
+  // Floored, so a low setting reads as dim rather than as a dead panel that sends you looking
+  // for a fault.
+  const uint8_t level = percent < MD_BACKLIGHT_MIN_PCT ? MD_BACKLIGHT_MIN_PCT : percent;
+
+  // Duty is a control voltage here, not a brightness.
+  //
+  // DISP reaches the MP3302's EN pin through R10/C12, which averages the PWM into DC, and the
+  // part programs 0-100% LED current from 0.7 V to 1.4 V. Mapping percent straight onto duty —
+  // which is what this did before the schematic was read — would put the whole usable range
+  // between 21% and 42% duty: dark below, saturated above, and a cliff in the middle. So the
+  // percentage picks a point in that voltage window and the duty follows from it.
+  const uint32_t mv =
+      MD_BACKLIGHT_EN_MIN_MV +
+      static_cast<uint32_t>(MD_BACKLIGHT_EN_MAX_MV - MD_BACKLIGHT_EN_MIN_MV) * level / 100;
+  const uint32_t duty = mv * kMaxDuty / MD_BACKLIGHT_PWM_MV;
+
+  ledcWrite(MD_BACKLIGHT_PWM_GPIO, duty);
+  MD_LOG.printf("[board] backlight %u%% via LEDC on GPIO%d (EN %lu mV, duty %lu/%lu)\n", level,
+                MD_BACKLIGHT_PWM_GPIO, static_cast<unsigned long>(mv),
+                static_cast<unsigned long>(duty), static_cast<unsigned long>(kMaxDuty));
   return;
 #else
   auto *backlight = g_board->getBacklight();

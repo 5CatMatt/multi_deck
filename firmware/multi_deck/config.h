@@ -8,7 +8,7 @@
 // Bump this with any behavioural firmware change. It rides along in the `hello` frame and the
 // agent logs it on connect, so "which build is actually on the device?" is answered by looking
 // rather than by remembering.
-#define MD_FW_VERSION    "0.6.1"
+#define MD_FW_VERSION    "0.6.3"
 #define MD_DEVICE_NAME   "multi_deck"
 #define MD_PROTO_VERSION 1
 
@@ -124,9 +124,41 @@ static_assert(!md_uses_panel_pin(MD_SD_MISO), "MD_SD_MISO is an RGB panel pin");
 // a percentage rather than a boolean, which was the point of building it that way.
 //
 // **Undefined by default on purpose.** Defining it without doing the hardware mod leaves the
-// panel permanently dark, because the expander line nobody is driving any more stays low.
+// panel stuck at full brightness: begin() still drives EXIO2 high, and the PWM goes to a GPIO
+// that is not connected to anything. Harmless, but it looks like the mod failing rather than
+// like the mod not having happened.
 //
-// #define MD_BACKLIGHT_PWM_GPIO 15
+// ⚠️ **Inject at R10, not at the DISP net.** DISP is two signals sharing one wire: the MP3302's
+// EN (through R10) *and* PORT1 pin 31, the LCD panel's own display enable. PWM on the shared net
+// chops the panel enable at 20kHz — the backlight dims perfectly, because R10/C12 average it,
+// and the panel blanks completely. Black screen, working touch, clean boot log; it took an
+// afternoon. So: leave R21 fitted, lift R10's DISP-side leg, and drive that leg from the GPIO.
+// See docs/hardware-notes.md.
+//
+// **Use GPIO16.** There is no unused pin on this board, so this is a choice about what to give
+// up, and RS485 is the cheapest thing to lose — on this pin it costs nothing else at all:
+//
+//   GPIO16   RS485_RXD. Reaches the SP3485 only through R68 (4.7k) into a transistor base, with
+//            R67 (4.7k) pulling up. **Nothing on the RS485 side ever drives it** — DI is tied to
+//            GND and the ESP transmits by modulating DE through that transistor, so GPIO16 is
+//            already an output in normal use. No cut, no isolation, ~1.3mA of load. ✅
+//
+//   GPIO15   RS485_TXD, and the trap. It is wired to the SP3485's **RO output** (R64 is a
+//            pull-up holding it high while the receiver is disabled, not a series resistor), so
+//            driving it means fighting a push-pull output. Needs a cut. ❌
+//
+//   GPIO6    Sensor header J6 pin 3 (AD). Physically the easiest tap — a through-hole header pin
+//            rather than a chip pad — but it costs the sensor header *and* requires moving
+//            MD_SD_CS_PLACEHOLDER, because SPI.begin()/SD.begin() genuinely drive that pin even
+//            though the card ignores it. The static_assert below refuses the collision.
+//
+//   Everything else is panel, flash (26-32), octal PSRAM (33-37, and taking one costs the LVGL
+//   draw buffers), SD SPI (11/12/13), USB (19/20), I2C (8/9), or UART0 (43/44 — the MD_LOG debug
+//   channel, which is how this board gets debugged at all).
+//
+// Tap GPIO16 at the R67/R68 pad on the IO16 side. docs/hardware-notes.md has the full accounting.
+//
+#define MD_BACKLIGHT_PWM_GPIO 16
 
 #ifdef MD_BACKLIGHT_PWM_GPIO
 static_assert(!md_uses_panel_pin(MD_BACKLIGHT_PWM_GPIO),
@@ -137,21 +169,65 @@ static_assert(MD_BACKLIGHT_PWM_GPIO != MD_SD_CS_PLACEHOLDER,
 static_assert(MD_BACKLIGHT_PWM_GPIO < 26 || MD_BACKLIGHT_PWM_GPIO > 37,
               "GPIO26-32 are flash and GPIO33-37 are octal PSRAM on an N8R8 module");
 
-// Conservative on purpose, and the first thing to change if the panel misbehaves.
+// Settled from the Waveshare schematic and the MP3302 datasheet, 2026-08-08.
 //
-// If the rewired line feeds a boost converter's *enable* input rather than a dedicated dimming
-// input, it has to restart the converter every cycle, and only low frequencies work — too high
-// and the backlight stays dark or flickers badly. If it feeds a real PWM/dimming pin, push this
-// to 20000 to get the switching above hearing: some backlight inductors sing audibly at 1-5kHz,
-// which is quiet but maddening on a desk.
+// DISP does not switch the backlight. It drives the **EN pin of an MP3302 LED boost driver**
+// through R10 (1k) with C12 (1uF) to ground — an RC low-pass with a corner at about 159 Hz. So
+// EN never sees a square wave; it sees the PWM's DC average. That is exactly the high-frequency
+// dimming arrangement the datasheet asks for, already fitted on the board.
 //
-// Sweep `brightness` across its range after the mod and listen as well as look.
+// The datasheet wants the filter corner ten times below the PWM frequency, which puts the floor
+// at ~1.6 kHz. 20 kHz clears that comfortably and is above hearing, which matters because the
+// converter runs continuously here rather than being chopped — there is no switching at the PWM
+// rate to sing at all.
+//
+// (This default used to be 1000 Hz, hedged against the possibility that DISP fed a bare enable
+// pin that had to restart the converter each cycle. It does not, and 1 kHz would sit only ~6x
+// above the corner and let visible ripple through.)
 #ifndef MD_BACKLIGHT_PWM_HZ
-#define MD_BACKLIGHT_PWM_HZ 1000
+#define MD_BACKLIGHT_PWM_HZ 20000
 #endif
+
+// EN is an analogue control input, not an on/off line, and its useful range is narrow: the
+// MP3302 programs 0-100% LED current from **0.7 V to 1.4 V** on that pin. With a 3.3 V PWM
+// swing that is roughly 21% to 42% duty — so mapping brightness linearly onto 0-100% duty would
+// give a dead panel below 21, the entire usable range crammed between 21 and 42, and no change
+// at all above that. board_port.cpp maps into this window instead.
+//
+// Millivolts rather than duty because that is the form the datasheet states them in, and the
+// form a multimeter on the EN side of R10 reports. If a sweep shows the panel reaching full
+// brightness early or never quite reaching it, trim these two rather than the mapping code.
+#ifndef MD_BACKLIGHT_EN_MIN_MV
+#define MD_BACKLIGHT_EN_MIN_MV 700
+#endif
+
+#ifndef MD_BACKLIGHT_EN_MAX_MV
+#define MD_BACKLIGHT_EN_MAX_MV 1400
+#endif
+
+// The PWM high level, i.e. the ESP32-S3's IO voltage. The DC that lands on EN is this times duty.
+#ifndef MD_BACKLIGHT_PWM_MV
+#define MD_BACKLIGHT_PWM_MV 3300
+#endif
+
+static_assert(MD_BACKLIGHT_EN_MIN_MV < MD_BACKLIGHT_EN_MAX_MV,
+              "MD_BACKLIGHT_EN_MIN_MV must be below MD_BACKLIGHT_EN_MAX_MV");
+static_assert(MD_BACKLIGHT_EN_MAX_MV <= MD_BACKLIGHT_PWM_MV,
+              "MD_BACKLIGHT_EN_MAX_MV exceeds the PWM swing — 100% duty could not reach it");
 
 #ifndef MD_BACKLIGHT_PWM_BITS
 #define MD_BACKLIGHT_PWM_BITS 10
+#endif
+
+// The idle overlay's starting opacity, 0-100 — see Theme::dim_opa.
+//
+// Defined in both arms below rather than once, because the right value depends entirely on
+// whether the backlight is real. The two knobs multiply: a veil sized to do the whole job alone
+// sitting on top of a genuine 15% backlight comes out around 7% of full, which on a dark theme
+// is indistinguishable from a dead panel. Measured the hard way, the first time the deck dimmed
+// after the rewire.
+#ifndef MD_DIM_OPA_DEFAULT
+#define MD_DIM_OPA_DEFAULT 0
 #endif
 
 // Floor for any non-zero request, so a low setting reads as "dim" rather than "broken". Zero is
@@ -159,6 +235,15 @@ static_assert(MD_BACKLIGHT_PWM_GPIO < 26 || MD_BACKLIGHT_PWM_GPIO > 37,
 #ifndef MD_BACKLIGHT_MIN_PCT
 #define MD_BACKLIGHT_MIN_PCT 4
 #endif
+
+#else  // no PWM backlight
+
+// The board as shipped: the backlight is on or off, so the overlay is the only thing that can
+// express "dimmed" at all and has to carry the whole effect by itself.
+#ifndef MD_DIM_OPA_DEFAULT
+#define MD_DIM_OPA_DEFAULT 55
+#endif
+
 #endif  // MD_BACKLIGHT_PWM_GPIO
 
 #define MD_DECK_JSON_PATH "/deck.json"

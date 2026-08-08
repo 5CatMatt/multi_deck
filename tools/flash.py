@@ -181,6 +181,15 @@ def flash() -> None:
 def monitor(seconds: float) -> None:
     import serial
 
+    # The device log is not guaranteed to be valid UTF-8 — a reset lands mid-line, and the ROM
+    # writes its own banner at a different baud rate — so decoding yields U+FFFD. A Windows
+    # console is cp1252, which cannot encode that, and the write raises after the flash has
+    # already succeeded. Reconfiguring the stream beats sanitising every line.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     port = uart_port()
     print(f"--- {port} ---")
     deadline = time.time() + seconds

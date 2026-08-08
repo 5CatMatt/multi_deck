@@ -90,14 +90,22 @@ tiles show an icon, a label, or both.
 ### Screen and messages
 
 The screen **dims after 2 minutes** of no touch and **switches off after 10**. Touching it brings
-it straight back, and that first touch only wakes — it does not also press whatever tile was
-under your finger.
+it straight back.
 
-Dimming is drawn rather than driven: the backlight on this board is a plain on/off line with no
-brightness control, so the deck darkens by drawing over itself. Switching off at 5 minutes is
-real — off is the one thing the backlight can genuinely do. `brightness` in
-[settings](docs/editing-the-deck.md) has no effect yet for the same reason. See
-[hardware-notes.md](docs/hardware-notes.md) for why, and for the rewire that makes it real.
+While it is dimmed the tiles are still legible, so a tap does what you aimed it at and brings the
+brightness up on its way. Once the screen has gone off — or the sleep clock is up — the first
+touch only wakes, because at that point there is nothing to aim at and a tap is a request to see
+the deck rather than to fire a macro you cannot see.
+
+`brightness` and `dim_pct` in [settings](docs/editing-the-deck.md) are real percentages, and the
+panel tracks them smoothly.
+
+That took a hardware modification. As shipped, this board's backlight is a bare on/off line on an
+I2C expander with no PWM anywhere, so every non-zero percentage was the same instruction and the
+deck could only fake dimming by drawing a translucent black layer over itself. Moving the
+backlight enable to a GPIO under LEDC makes the numbers mean something. The overlay still exists,
+but only to swallow the touch that wakes the screen — a tap that wakes should not also fire a
+macro you cannot see. See [hardware-notes.md](docs/hardware-notes.md) for the mod.
 
 Transient messages — layout reloaded, agent not connected, a wallpaper that would not load —
 appear at the bottom of the screen for about 2.5 seconds.
