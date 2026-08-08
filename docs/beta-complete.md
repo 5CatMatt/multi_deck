@@ -77,22 +77,31 @@ Things worth paying attention to specifically:
 
 Ordered by value-for-effort, not by ambition.
 
-### 1. PWM backlight — the rewire *(committed to, not merely considered)*
+### 1. PWM backlight — **the firmware is done; only the soldering is left**
 
-The one item here that is definitely happening. The backlight enable is a bare on/off line on
-CH422G EXIO2; moving it to **GPIO15 or GPIO16** under LEDC makes `brightness`, `dim_pct` and the
-`backlight` frame literal instead of approximate.
+The backlight enable is a bare on/off line on CH422G EXIO2, which has no PWM. Move it to a free
+GPIO and `brightness`, `dim_pct` and the `backlight` frame all become literal instead of
+approximate.
 
-Firmware is `MD_BACKLIGHT_PWM_GPIO` in `config.h` plus an LEDC branch in
-`board_port::setBacklight()` — **one file**, because every layer above it already passes
-percentages rather than booleans. Nothing built in this round should need rewriting; if it does,
-the two-knob split was got wrong.
+**The software side is written, compiled and guard-tested.** Doing the mod is three steps:
 
-Check the Waveshare schematic before cutting: whether the driver's enable input tolerates PWM at
-LEDC rates, and whether EXIO2 gates anything else, decides where the trace comes off. Record what
-the board turns out to do in [hardware-notes.md](hardware-notes.md).
+1. Jumper the backlight enable to **GPIO15 or GPIO16** — schematic check first, since whether
+   the driver's enable input tolerates PWM at all, and whether EXIO2 gates anything else,
+   decides where the trace comes off.
+2. Uncomment `#define MD_BACKLIGHT_PWM_GPIO 15` in `config.h`.
+3. `python tools/flash.py`.
 
-*Touches:* `board_port.cpp`, `config.h`.
+Both paths compile: disabled costs **0 bytes**, enabled costs ~7.8 KB for the LEDC driver. All
+three pin guards were verified by building against GPIO10, GPIO6 and GPIO30 and reading the
+errors, so the GPIO10 class of mistake cannot recur silently.
+
+`MD_BACKLIGHT_PWM_HZ` defaults to a deliberately low 1000 and is the first thing to change if the
+panel misbehaves — full reasoning in the rewire section of
+[hardware-notes.md](hardware-notes.md). **Sweep `brightness` afterwards and listen as well as
+look**, then re-run the idle and sleep-clock checks. If either needs a code change to survive
+real PWM, the two-knob split was got wrong, and that is worth knowing.
+
+*Touches:* `board_port.cpp`, `config.h` — and nothing else, by design.
 
 ### 2. Slimmer nav — small
 

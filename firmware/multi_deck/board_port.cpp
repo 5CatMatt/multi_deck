@@ -72,6 +72,24 @@ bool begin() {
   // Polarity is UNVERIFIED — see MD_USB_SEL_USB_LEVEL in config.h.
   expanderWrite(MD_EXIO_USB_SEL, MD_USB_SEL_USB_LEVEL);
 
+#ifdef MD_BACKLIGHT_PWM_GPIO
+  // Before ui::begin(), which sets the backlight as soon as the idle state is applied. A
+  // ledcWrite() to an unattached pin is silently ignored, so getting this order wrong would look
+  // like the mod not working rather than like a missing init.
+  if (!ledcAttach(MD_BACKLIGHT_PWM_GPIO, MD_BACKLIGHT_PWM_HZ, MD_BACKLIGHT_PWM_BITS)) {
+    MD_LOG.printf("[board] LEDC would not attach to GPIO%d — backlight will not respond\n",
+                  MD_BACKLIGHT_PWM_GPIO);
+  } else {
+    MD_LOG.printf("[board] backlight on GPIO%d, %d Hz, %d-bit\n", MD_BACKLIGHT_PWM_GPIO,
+                  MD_BACKLIGHT_PWM_HZ, MD_BACKLIGHT_PWM_BITS);
+  }
+
+  // The expander line is no longer wired to anything after the mod, but drive it high anyway:
+  // if the trace was left intact and the GPIO merely paralleled onto it, a low here would fight
+  // the PWM and hold the panel dark.
+  expanderWrite(MD_EXIO_DISP, HIGH);
+#endif
+
   MD_LOG.printf("[board] up: %ux%u\n", MD_SCREEN_W, MD_SCREEN_H);
   return true;
 }
@@ -130,6 +148,23 @@ bool readTouch(int16_t &x, int16_t &y) {
 void setBacklight(uint8_t percent) {
   if (percent > 100) percent = 100;
 
+#ifdef MD_BACKLIGHT_PWM_GPIO
+  // The rewired path: percentages mean percentages.
+  //
+  // This is the whole of the PWM change. Everything above passes a percentage rather than a
+  // boolean — the idle machine, the theme, the `backlight` frame — so none of it knew or cared
+  // that the number was being thrown away, and none of it needed touching when it stopped being.
+  //
+  // Zero is honoured exactly; anything else is floored, so a low setting reads as dim rather
+  // than as a dead panel that sends you looking for a fault.
+  const uint8_t level = (percent == 0) ? 0
+                                       : (percent < MD_BACKLIGHT_MIN_PCT ? MD_BACKLIGHT_MIN_PCT
+                                                                         : percent);
+  constexpr uint32_t kMaxDuty = (1u << MD_BACKLIGHT_PWM_BITS) - 1;
+  ledcWrite(MD_BACKLIGHT_PWM_GPIO, static_cast<uint32_t>(level) * kMaxDuty / 100);
+  MD_LOG.printf("[board] backlight %u%% via LEDC on GPIO%d\n", level, MD_BACKLIGHT_PWM_GPIO);
+  return;
+#else
   auto *backlight = g_board->getBacklight();
   if (backlight != nullptr) {
     const bool ok = backlight->setBrightness(percent);
@@ -138,6 +173,7 @@ void setBacklight(uint8_t percent) {
   }
 
   MD_LOG.printf("[board] backlight %u%% via EXIO%u\n", percent, MD_EXIO_DISP);
+#endif
 
   // Fall back to the raw enable line if the profile exposes no PWM backlight.
   expanderWrite(MD_EXIO_DISP, percent > 0 ? HIGH : LOW);

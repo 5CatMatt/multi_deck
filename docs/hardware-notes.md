@@ -397,13 +397,43 @@ int level = (percent > 0) ? _config.on_level : !_config.on_level;   // switch_ex
 The backlight enable hangs off the CH422G I2C expander, which has no PWM. **Every non-zero
 percentage is identical**; only `setBacklight(0)` does anything.
 
-**This is a wiring limitation, not a permanent one.** Moving the enable line to a free GPIO under
-LEDC makes percentages literal. GPIO15 and GPIO16 are the candidates — GPIO6 is spoken for as
-`MD_SD_CS_PLACEHOLDER`, and everything else is panel, flash (26–32) or octal PSRAM (33–37).
-Whichever is used still goes through the `md_uses_panel_pin()` `static_assert`, so the GPIO10
-class of mistake cannot recur. Firmware side is `MD_BACKLIGHT_PWM_GPIO` in `config.h` plus an
-LEDC branch in `board_port::setBacklight()` — **one file**, because everything above it passes
-percentages rather than booleans.
+**This is a wiring limitation, not a permanent one, and the firmware side is already written.**
+
+### Doing the rewire
+
+1. **Move the backlight enable** from CH422G EXIO2 to **GPIO15 or GPIO16**. Those are the only
+   free candidates: GPIO6 is spoken for as `MD_SD_CS_PLACEHOLDER`, and everything else is panel,
+   flash (26–32) or octal PSRAM (33–37). Check the Waveshare schematic first — whether the
+   driver's enable input tolerates PWM at all, and whether EXIO2 gates anything besides the
+   backlight, decides where the trace comes off.
+2. **Uncomment one line** in `config.h`:
+   ```c
+   #define MD_BACKLIGHT_PWM_GPIO 15
+   ```
+3. Flash. That is the entire software change — `board_port::setBacklight()` already has the LEDC
+   branch, and everything above it passes percentages rather than booleans, so nothing else knew
+   the number was being discarded and nothing else needs telling that it no longer is.
+
+The pin choice is guarded at compile time, verified by building against each bad case:
+
+| Pin | Result |
+|---|---|
+| 10 | `MD_BACKLIGHT_PWM_GPIO is an RGB panel pin…` |
+| 6 | `MD_BACKLIGHT_PWM_GPIO collides with MD_SD_CS_PLACEHOLDER` |
+| 30 | `GPIO26-32 are flash and GPIO33-37 are octal PSRAM…` |
+
+Do not define the macro before doing the mod: it stops driving EXIO2, so the panel goes dark.
+
+**`MD_BACKLIGHT_PWM_HZ` defaults to 1000, deliberately low, and is the first thing to change if
+the panel misbehaves.** If the rewired line feeds a boost converter's *enable* pin rather than a
+dedicated dimming input, it must restart the converter every cycle and only low frequencies
+work — too high and the backlight stays dark or flickers. If it feeds a real PWM input, raise it
+to 20000 to put the switching above hearing; some backlight inductors sing at 1–5 kHz, which is
+quiet but maddening at a desk. **Sweep `brightness` across its range afterwards and listen as
+well as look.**
+
+`MD_BACKLIGHT_MIN_PCT` (default 4) floors any non-zero request so a low setting reads as dim
+rather than as a dead panel. Zero is still honoured exactly.
 
 **So do not write code that assumes brightness is binary.** The UI carries two knobs that
 multiply: the real backlight, always called with a real percentage, and a full-screen

@@ -111,6 +111,56 @@ static_assert(!md_uses_panel_pin(MD_SD_MOSI), "MD_SD_MOSI is an RGB panel pin");
 static_assert(!md_uses_panel_pin(MD_SD_SCK), "MD_SD_SCK is an RGB panel pin");
 static_assert(!md_uses_panel_pin(MD_SD_MISO), "MD_SD_MISO is an RGB panel pin");
 
+// ---------------------------------------------------------------------------
+// Backlight
+// ---------------------------------------------------------------------------
+// As shipped, the backlight is a bare on/off line on CH422G EXIO2. The board profile selects
+// ESP_PANEL_BACKLIGHT_TYPE_SWITCH_EXPANDER, whose setBrightness() is literally
+// `(percent > 0) ? on : off`, and the CH422G has no PWM — so every non-zero percentage is the
+// same instruction and only 0 does anything.
+//
+// Define MD_BACKLIGHT_PWM_GPIO after rewiring the backlight enable to a spare GPIO, and
+// percentages become literal. Nothing above board_port.cpp changes: every layer already passes
+// a percentage rather than a boolean, which was the point of building it that way.
+//
+// **Undefined by default on purpose.** Defining it without doing the hardware mod leaves the
+// panel permanently dark, because the expander line nobody is driving any more stays low.
+//
+// #define MD_BACKLIGHT_PWM_GPIO 15
+
+#ifdef MD_BACKLIGHT_PWM_GPIO
+static_assert(!md_uses_panel_pin(MD_BACKLIGHT_PWM_GPIO),
+              "MD_BACKLIGHT_PWM_GPIO is an RGB panel pin. Driving it would delete a colour "
+              "bit the same way MD_SD_CS_PLACEHOLDER once deleted blue bit 4.");
+static_assert(MD_BACKLIGHT_PWM_GPIO != MD_SD_CS_PLACEHOLDER,
+              "MD_BACKLIGHT_PWM_GPIO collides with MD_SD_CS_PLACEHOLDER");
+static_assert(MD_BACKLIGHT_PWM_GPIO < 26 || MD_BACKLIGHT_PWM_GPIO > 37,
+              "GPIO26-32 are flash and GPIO33-37 are octal PSRAM on an N8R8 module");
+
+// Conservative on purpose, and the first thing to change if the panel misbehaves.
+//
+// If the rewired line feeds a boost converter's *enable* input rather than a dedicated dimming
+// input, it has to restart the converter every cycle, and only low frequencies work — too high
+// and the backlight stays dark or flickers badly. If it feeds a real PWM/dimming pin, push this
+// to 20000 to get the switching above hearing: some backlight inductors sing audibly at 1-5kHz,
+// which is quiet but maddening on a desk.
+//
+// Sweep `brightness` across its range after the mod and listen as well as look.
+#ifndef MD_BACKLIGHT_PWM_HZ
+#define MD_BACKLIGHT_PWM_HZ 1000
+#endif
+
+#ifndef MD_BACKLIGHT_PWM_BITS
+#define MD_BACKLIGHT_PWM_BITS 10
+#endif
+
+// Floor for any non-zero request, so a low setting reads as "dim" rather than "broken". Zero is
+// still honoured exactly — off means off.
+#ifndef MD_BACKLIGHT_MIN_PCT
+#define MD_BACKLIGHT_MIN_PCT 4
+#endif
+#endif  // MD_BACKLIGHT_PWM_GPIO
+
 #define MD_DECK_JSON_PATH "/deck.json"
 #define MD_ICON_DIR       "/icons"
 
