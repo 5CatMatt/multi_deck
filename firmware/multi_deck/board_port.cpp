@@ -132,9 +132,12 @@ void setBacklight(uint8_t percent) {
 
   auto *backlight = g_board->getBacklight();
   if (backlight != nullptr) {
-    backlight->setBrightness(percent);
+    const bool ok = backlight->setBrightness(percent);
+    MD_LOG.printf("[board] backlight %u%% via driver%s\n", percent, ok ? "" : " FAILED");
     return;
   }
+
+  MD_LOG.printf("[board] backlight %u%% via EXIO%u\n", percent, MD_EXIO_DISP);
 
   // Fall back to the raw enable line if the profile exposes no PWM backlight.
   expanderWrite(MD_EXIO_DISP, percent > 0 ? HIGH : LOW);

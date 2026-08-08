@@ -85,7 +85,7 @@ def _quantise(alpha: bytes, levels: int) -> list[int]:
 # --- front end: TTF / OTF ---------------------------------------------------------------
 
 
-def render_truetype(path: Path, size: int, bpp: int) -> Face:
+def render_truetype(path: Path, size: int, bpp: int, chars: str | None = None) -> Face:
     Image, ImageDraw, ImageFont = _require_pillow()
 
     font = ImageFont.truetype(str(path), size)
@@ -96,8 +96,13 @@ def render_truetype(path: Path, size: int, bpp: int) -> Face:
     pad = max(size, 8)
     canvas_size = (size * 3 + 2 * pad, size * 3 + 2 * pad)
 
+    # A subset is not an optimisation to reach for casually, but at large sizes it is the
+    # difference between usable and absurd: bitmap cost grows with the square of the size, so a
+    # 96px face costs ~180KB of flash for the full ASCII range. A clock needs eleven glyphs.
+    codes = sorted({ord(c) for c in chars}) if chars else list(range(FIRST_CP, LAST_CP + 1))
+
     glyphs: list[Glyph] = []
-    for code in range(FIRST_CP, LAST_CP + 1):
+    for code in codes:
         char = chr(code)
         adv_w = int(round(font.getlength(char) * 16))  # 1/16 px, as LVGL stores it
 
@@ -348,6 +353,13 @@ def main(argv: list[str] | None = None) -> int:
         "--sizes", type=int, nargs="+", help="pixel sizes; TTF/OTF only, VLW carries its own"
     )
     parser.add_argument("--bpp", type=int, default=4, choices=(4,))
+    parser.add_argument(
+        "--chars",
+        help=(
+            "render only these characters, e.g. '0123456789:' for a clock. TTF/OTF only. "
+            "Bitmap cost is quadratic in size, so a large face wants a subset"
+        ),
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("firmware/multi_deck"))
     parser.add_argument(
         "--fallback",
@@ -369,10 +381,15 @@ def main(argv: list[str] | None = None) -> int:
             if not args.sizes:
                 print(f"error: {source.name} needs --sizes", file=sys.stderr)
                 return 1
-            faces.extend((render_truetype(source, s, args.bpp), source) for s in args.sizes)
+            faces.extend(
+                (render_truetype(source, s, args.bpp, args.chars), source)
+                for s in args.sizes
+            )
         else:
             if args.sizes:
                 print(f"note: {source.name} is VLW; --sizes ignored", file=sys.stderr)
+            if args.chars:
+                print(f"note: {source.name} is VLW; --chars ignored", file=sys.stderr)
             faces.append((render_vlw(read_vlw(source), args.bpp), source))
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -381,8 +398,13 @@ def main(argv: list[str] | None = None) -> int:
         text = emit(args.name, face, source, args.bpp, args.fallback)
         dst = args.out_dir / f"font_{args.name}_{face.size}.c"
         dst.write_text(text, encoding="utf-8", newline="\n")
-        gap = sorted(set(range(FIRST_CP, LAST_CP + 1)) - {g.code for g in face.glyphs})
-        note = f", {len(gap)} ASCII gaps -> fallback" if gap else ""
+        if args.chars:
+            # Every unrendered codepoint is a deliberate omission here, so reporting them as
+            # "gaps" would turn an intended subset into a scary-looking warning.
+            note = ", subset"
+        else:
+            gap = sorted(set(range(FIRST_CP, LAST_CP + 1)) - {g.code for g in face.glyphs})
+            note = f", {len(gap)} ASCII gaps -> fallback" if gap else ""
         print(f"{source.name} -> {dst}  ({face.size}px, {len(face.glyphs)} glyphs{note})")
 
     print("\nDeclare them in fonts.h and expose them through theme.h.")

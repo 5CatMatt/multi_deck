@@ -27,6 +27,12 @@ void switchTheme(const String &target);
 // Greys out tiles whose actions need the agent. Device-local tiles stay live.
 void setLinkUp(bool up);
 
+// The PC told us it is going to sleep, or coming back. Only an explicit announcement puts the
+// sleep screen up — the deck cannot tell a sleeping PC from a closed agent by looking at the
+// link, so silence alone keeps today's behaviour of greying the status dot and nothing more.
+void enterSleep();
+void leaveSleep();
+
 void toast(const String &message);
 
 // Handles a `hid_exec` frame: the agent sequencing a mixed macro asks us to perform a

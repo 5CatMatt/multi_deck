@@ -261,6 +261,146 @@ deliberately *not* logged: `USBCDC::write()` returns 0 when the port is closed, 
 a second or two after a reset while the device announces itself before the host reopens COM. Only
 a partial write indicates a desynchronised stream.
 
+## ✅ Port B can flash the board too — and it is the more reliable one
+
+If a flash dies partway with **`A fatal error occurred: No more data to read from the serial
+port`**, do not keep retrying over port A. Flash over **port B** instead.
+
+Observed 2026-08-02: the CH343 on port A dropped off the USB bus partway through every 1.1MB app
+write — at 28%, then 36%, then 28% again — at 921600, 460800 and 115200 baud alike, while the
+small bootloader and partition images (a few KB each) wrote fine every time. Lowering the baud
+rate does not help, because the connection is not corrupting data, it is disappearing.
+
+**When the app is not running, port B enumerates as the ESP32-S3's built-in USB-Serial-JTAG** — a
+separate COM port, plus a "USB JTAG/serial debug unit" device. That is native USB with no bridge
+chip in the path, so there is simply less to fail. It wrote the whole app and verified in **7
+seconds, first attempt**, having failed five times over port A.
+
+It is a three-step procedure, because the JTAG port only exists while the app is stopped and
+`esptool` cannot reset the board through it. **Port A drives the reset; port B carries the data.**
+
+**1. Drop the chip into download mode from port A.** RTS drives `EN`, DTR drives `IO0`:
+
+```python
+s = serial.Serial('COM4', 115200, timeout=0.2)
+s.setDTR(False); s.setRTS(True); time.sleep(0.15)   # hold in reset, IO0 high
+s.setDTR(True)                                      # IO0 low = download mode
+s.setRTS(False); time.sleep(0.15)                   # release reset
+s.setDTR(False); s.close()
+```
+
+A new COM port appears within a couple of seconds — that is the JTAG unit on port B.
+
+**2. Write over it with `--before no-reset`**, since the board is already where it needs to be:
+
+```powershell
+& "$env:LOCALAPPDATA\Arduino15\packages\esp32\tools\esptool_py\5.3.1\esptool.exe" `
+    --chip esp32s3 -p COM5 --before no-reset --after hard-reset `
+    write-flash --flash-mode dio --flash-freq 80m --flash-size 8MB `
+    0x10000 "$env:LOCALAPPDATA\arduino\sketches\<hash>\multi_deck.ino.bin"
+```
+
+**3. Reset from port A again**, with `IO0` left high this time — the same snippet without the
+`setDTR(True)` line. `--after hard-reset` toggles RTS on the *JTAG* port, which is not wired to
+`EN`, so the board stays in the ROM and looks like a failed flash when it is nothing of the kind.
+That step is the one that is easy to miss.
+
+Two further things to know:
+
+- **Its COM number is not port B's usual one.** The JTAG unit and the running app's TinyUSB
+  composite are different USB devices, so they get different ports — COM5 and COM6 here. The
+  agent copes (it re-enumerates every reconnect and logs `deck moved from COM5 to COM6`), but do
+  not go looking for the deck's normal port while the app is stopped.
+- **`arduino-cli upload` cannot use this path**, since it drives one port for both jobs. Compile
+  with `arduino-cli compile`, then flash the `.bin` out of its build directory by hand.
+
+### Corollary: esptool 5.x does diff-based writes, which a corrupt flash defeats
+
+esptool 5.3.1 compares flash against the image and rewrites only changed sectors ("fast
+reflashing", visible as many small scattered writes rather than one large one). That is normally a
+speed win, but after an interrupted upload it can leave a **corrupt image looking partly
+up-to-date**, and the board then boot-loops on
+
+```
+Assert failed in verify_load_addresses, esp_image_format.c:437 (load_end > load_addr)
+```
+
+`erase-flash` first, then write, when the previous upload did not finish cleanly. Nothing in
+this project keeps state in flash — the layout, the theme and the assets all live on the SD
+card — so a full erase costs nothing but the flashing time.
+
+## Diagnosing "the deck is dead after a flash"
+
+Both halves of this looked like a bad firmware build and neither was. Work through it in this
+order — it takes two minutes and skips an hour of reading diffs.
+
+**1. Is the firmware running?** Reset over port A and read the log. `esptool` is not needed:
+
+```python
+s = serial.Serial('COM4', 115200, timeout=0.2)
+s.setDTR(False); s.setRTS(True); time.sleep(0.2); s.setRTS(False)   # EN follows RTS
+```
+
+A healthy boot ends with `[main] ready`. If you see that, **the firmware is fine** and both a
+black screen and a dead link are something else. A crash or boot loop looks completely different:
+truncated output, or the banner repeating.
+
+**2. Is the panel actually off, or just dark?** `[ui] idle=... backlight=... veil=...` is printed
+on every idle transition for exactly this reason. `backlight=80 veil=0` with a black screen means
+the panel is lit and the *content* is dark — check the theme before the hardware. A near-black
+theme under a dark wallpaper is indistinguishable from a dead panel across a room.
+
+**3. Is the host seeing the device at all?**
+
+```powershell
+Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like "*VID_303A*" }
+```
+
+**Zero rows is a physical-layer answer, not a firmware one.** The firmware will still happily log
+`[link] USB CDC started` and `[hid] keyboard + consumer control started`, because those run before
+anything checks whether a host is there — TinyUSB cannot attach without VBUS on port B, and it
+does not complain about its absence. Zero rows means the cable is out, is power-only, or has
+failed. A device that is present but failing enumeration shows up instead as a present
+*Unknown USB Device (Device Descriptor Request Failed)*, which is a different problem entirely.
+
+Drop `-PresentOnly` and you get every device the machine has ever seen, which is misleading —
+ghost entries all read `Status: Unknown` and will happily show you a COM port that has not existed
+for months.
+
+## ⚠️ The backlight is on/off only — until it is rewired
+
+`settings.brightness` did nothing for the project's first five months, and the README described a
+dim-to-10% behaviour that could not happen. Not a bug in our code: the board profile
+(`BOARD_WAVESHARE_ESP32_S3_TOUCH_LCD_4_3.h:245`) selects
+
+```c
+#define ESP_PANEL_BOARD_BACKLIGHT_TYPE  (ESP_PANEL_BACKLIGHT_TYPE_SWITCH_EXPANDER)
+#define ESP_PANEL_BOARD_BACKLIGHT_IO    (2)     // CH422G EXIO2
+```
+
+and that driver's brightness control is, in full:
+
+```c
+int level = (percent > 0) ? _config.on_level : !_config.on_level;   // switch_expander.cpp:95
+```
+
+The backlight enable hangs off the CH422G I2C expander, which has no PWM. **Every non-zero
+percentage is identical**; only `setBacklight(0)` does anything.
+
+**This is a wiring limitation, not a permanent one.** Moving the enable line to a free GPIO under
+LEDC makes percentages literal. GPIO15 and GPIO16 are the candidates — GPIO6 is spoken for as
+`MD_SD_CS_PLACEHOLDER`, and everything else is panel, flash (26–32) or octal PSRAM (33–37).
+Whichever is used still goes through the `md_uses_panel_pin()` `static_assert`, so the GPIO10
+class of mistake cannot recur. Firmware side is `MD_BACKLIGHT_PWM_GPIO` in `config.h` plus an
+LEDC branch in `board_port::setBacklight()` — **one file**, because everything above it passes
+percentages rather than booleans.
+
+**So do not write code that assumes brightness is binary.** The UI carries two knobs that
+multiply: the real backlight, always called with a real percentage, and a full-screen
+translucent black overlay that supplies darkness below the backlight's floor. The overlay is
+what makes the sleep clock readable at night and stays useful after the rewire; the backlight
+call is what starts working the day the wire moves. Neither is a workaround for the other.
+
 ## ✅ Benign boot warning: GT911 "Unable to initialize the I2C address"
 
 ```
@@ -485,6 +625,25 @@ python tools/make_font.py C:/Windows/Fonts/GOTHIC.TTF --name century --sizes 20 
 It writes `firmware/multi_deck/font_<name>_<size>.c`, one per size. Declare them in
 [fonts.h](../firmware/multi_deck/fonts.h) and expose them through `theme.h` alongside the
 Montserrat pointers. Century Gothic at 20/28/40 costs **43 KB of flash** for all three.
+
+### Large faces need `--chars`
+
+Bitmap cost grows with the **square** of the size, so the full ASCII range that is fine at 28 px
+becomes absurd at 96: about **180 KB of flash** for glyphs you will never draw. The sleep clock
+needs eleven of them.
+
+```powershell
+python tools/make_font.py C:/Windows/Fonts/GOTHIC.TTF --name centuryclock --sizes 96 `
+    --chars "0123456789:" --fallback lv_font_montserrat_40
+```
+
+That is ~20 KB instead. `0`–`:` is U+0030–U+003A, contiguous, so it still takes the cheap
+`FORMAT0_TINY` cmap rather than the sparse one. Name a subset face for its job rather than its
+family — `centuryclock`, not `century` — because `font_century_96.c` would look like a
+general-purpose size and be reached for as one.
+
+Give a subset an explicit `--fallback` that exists: a label that unexpectedly contains a letter
+then renders small rather than not at all.
 
 ### Why not lv_font_conv
 

@@ -89,11 +89,39 @@ tiles show an icon, a label, or both.
 
 ### Screen and messages
 
-The backlight **dims to 10% after 60 seconds** of no touch and comes straight back when you touch
-it. It does not switch off entirely.
+The screen **dims after 60 seconds** of no touch and **switches off after 5 minutes**. Touching
+it brings it straight back, and that first touch only wakes — it does not also press whatever
+tile was under your finger.
+
+Dimming is drawn rather than driven: the backlight on this board is a plain on/off line with no
+brightness control, so the deck darkens by drawing over itself. Switching off at 5 minutes is
+real — off is the one thing the backlight can genuinely do. `brightness` in
+[settings](docs/editing-the-deck.md) has no effect yet for the same reason. See
+[hardware-notes.md](docs/hardware-notes.md) for why, and for the rewire that makes it real.
 
 Transient messages — layout reloaded, agent not connected, a wallpaper that would not load —
 appear at the bottom of the screen for about 2.5 seconds.
+
+### When the PC sleeps
+
+The deck notices, and turns into a clock: large, dark, and readable across a room at night
+without lighting one. Touch it to get the deck back — the PC stays asleep.
+
+It gets there two ways. The agent announces the sleep if it can, which is instant. Failing that
+— and on a Modern Standby laptop it usually does fail, because the machine freezes the agent in
+the same second it dims the display — the deck shows the clock at the point it would otherwise
+have switched the screen off. So a closed agent or an unplugged cable eventually gets you a
+clock too, which beats the black screen that was there before.
+
+The deck has no battery-backed clock, so it learns the time from the PC on connect and once a
+minute after. Until the first sync it says so rather than showing a wrong time.
+
+### Calendar
+
+A month at a glance, for when you want to know what day the 14th falls on. Arrows step months,
+**Today** jumps back. Not a scheduler — Windows has one of those.
+
+It needs the PC only to learn today's date, so it keeps working with the agent closed.
 
 ### Changing what is on it
 
@@ -208,7 +236,7 @@ Those FQBN options are the same settings listed in [docs/hardware-notes.md](docs
 SPIFFS)*, `USBMode=default` is *USB-OTG (TinyUSB)* (`build.usb_mode=0` — the mode HID requires), and
 `CDCOnBoot=default` is *Disabled*, which keeps `Serial` on UART0.
 
-Current footprint: ~865KB program (25% of the 3MB app partition), ~106KB static RAM.
+Current footprint: ~1.10MB program (33% of the 3MB app partition), ~107KB static RAM.
 
 Linker warnings about `missing .note.GNU-stack section` are toolchain noise and can be ignored.
 

@@ -94,6 +94,7 @@ Theme parseTheme(JsonObjectConst src) {
 
   parsePercent(src["tile_opa"], theme.tile_opa);
   parsePercent(src["border_opa"], theme.border_opa);
+  parsePercent(src["dim_opa"], theme.dim_opa);
 
   if (src["radius"].is<int>()) {
     int r = src["radius"].as<int>();
@@ -114,13 +115,14 @@ bool Theme::operator==(const Theme &o) const {
          tile_grad == o.tile_grad && border == o.border && accent == o.accent &&
          text == o.text && text_muted == o.text_muted && ok == o.ok && idle == o.idle &&
          tile_opa == o.tile_opa && border_opa == o.border_opa && radius == o.radius &&
-         flip180 == o.flip180 && display == o.display;
+         dim_opa == o.dim_opa && flip180 == o.flip180 && display == o.display;
 }
 
 void Theme::log() const {
   MD_LOG.printf(
-      "[theme] \"%s\" bg=#%06X tile=#%06X grad=#%06X opa=%u border=#%06X/%u radius=%u\n",
-      name.c_str(), bg, tile, tile_grad, tile_opa, border, border_opa, radius);
+      "[theme] \"%s\" bg=#%06X tile=#%06X grad=#%06X opa=%u border=#%06X/%u radius=%u "
+      "dim_opa=%u\n",
+      name.c_str(), bg, tile, tile_grad, tile_opa, border, border_opa, radius, dim_opa);
   MD_LOG.printf(
       "[theme]   accent=#%06X text=#%06X muted=#%06X ok=#%06X idle=#%06X flip180=%d "
       "display=%s wallpaper=%s\n",
@@ -224,6 +226,7 @@ bool DeckConfig::parse(JsonObjectConst root) {
   settings.brightness = s["brightness"] | 80;
   settings.idle_dim_s = s["idle_dim_s"] | 60;
   settings.idle_off_s = s["idle_off_s"] | 300;
+  settings.dim_pct = s["dim_pct"] | 15;
   settings.theme_name = String(s["theme"] | "");
   settings.display = tileDisplayFromString(s["display"], TileDisplay::IconText);
   MD_LOG.printf("[config] tile display: %s\n", tileDisplayName(settings.display));
@@ -246,6 +249,8 @@ bool DeckConfig::parse(JsonObjectConst root) {
       page.type = PageType::Numpad;
     } else if (strcmp(type, "stats") == 0) {
       page.type = PageType::Stats;
+    } else if (strcmp(type, "calendar") == 0) {
+      page.type = PageType::Calendar;
     } else if (strcmp(type, "colortest") == 0) {
       page.type = PageType::ColorTest;
     } else {

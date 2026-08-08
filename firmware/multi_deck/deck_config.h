@@ -73,7 +73,7 @@ struct Button {
   bool local = false;
 };
 
-enum class PageType : uint8_t { Grid, Numpad, Stats, ColorTest };
+enum class PageType : uint8_t { Grid, Numpad, Stats, Calendar, ColorTest };
 
 struct Page {
   String id;
@@ -105,6 +105,10 @@ struct Theme {
   uint8_t border_opa = 0;   // 0-100
   uint8_t radius = 10;
 
+  // How dark the idle overlay goes, 0-100. A theme token rather than a setting because a pale
+  // theme needs a heavier veil than a dark one to read as equally dimmed.
+  uint8_t dim_opa = 55;
+
   bool flip180 = MD_ROTATE_180;
 
   // Inherit by default: a theme is about colour, and most decks want one anatomy throughout.
@@ -122,10 +126,30 @@ struct Theme {
   bool operator!=(const Theme &o) const { return !(*this == o); }
 };
 
+// Brightness on this deck is two knobs that multiply, and the code always drives both.
+//
+// `board_port::setBacklight(percent)` is the real one. On the board as shipped it is a single
+// on/off line on the CH422G expander — the panel profile selects
+// ESP_PANEL_BACKLIGHT_TYPE_SWITCH_EXPANDER, whose setBrightness() is literally
+// `(percent > 0) ? on : off` — so today every non-zero value looks the same. That is a wiring
+// limitation, not a permanent one: moving the backlight enable to a free GPIO under LEDC makes
+// percentages mean percentages, and it changes only board_port.cpp.
+//
+// The second knob is a translucent black overlay drawn over everything, which gives darkness
+// below whatever the backlight's floor turns out to be. It is what makes the sleep clock
+// readable at night, and it stays useful after the rewire.
+//
+// So: nothing here is written as a workaround for the missing PWM. Every value stays a
+// percentage and every state sets both knobs.
 struct Settings {
   int brightness = 80;
   int idle_dim_s = 60;
   int idle_off_s = 300;
+
+  // Backlight level while dimmed. Distinct from the overlay: this one starts working the day
+  // the backlight gains PWM, without anything else changing.
+  int dim_pct = 15;
+
   String theme_name;  // which theme to start on; empty means the first
 
   // The root of the display chain, and the only level that must be concrete. IconText rather

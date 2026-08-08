@@ -23,6 +23,34 @@ The device opens with `hello` as soon as it sees DTR asserted, and repeats every
 `welcome`. A `proto` mismatch is a **hard failure on both sides**: log loudly, show it on-screen, and
 do not attempt to interoperate.
 
+### Both ends must end a session on a clock, not on an error
+
+The two ways a link dies are both silent. Reads that return nothing and writes that vanish into a
+closed port raise no exception on either side, so neither end can wait to be told.
+
+| Deadline | Where | What it catches |
+|---|---|---|
+| `MD_LINK_TIMEOUT_MS` (5s) | device | Host stopped answering without closing the port |
+| `SILENCE_TIMEOUT_S` (10s) | agent | Device stopped answering — five missed pings |
+| `HANDSHAKE_TIMEOUT_S` (10s) | agent | **Port open, no `hello` ever.** Close it and reopen |
+
+The third is the one that cost the most to find. When a laptop wakes from Modern Standby the COM
+port comes back within a couple of seconds, but the device's CDC does not always come back with
+it — so the agent held an open port, sent `identify` into it every 2s, and waited. Forever, in
+principle; in practice until some unrelated stale-handle error surfaced, which one morning took
+2, then 4.5, then 6 minutes across three cycles.
+
+**Reopening is the remedy, not merely the retry.** A fresh `serial.Serial()` re-asserts DTR, and
+that is what prods the device into announcing itself again.
+
+Two further rules on the agent side, both learned the same way:
+
+- **Re-enumerate on every attempt.** Caching the discovered port meant that when Windows handed
+  the deck a different COM number after a suspend, the agent reopened a port that no longer
+  existed until it was restarted — 1273 consecutive times in one overnight run.
+- **Back off, and log the first failure only.** That same run buried an hour of history under
+  identical warnings, and the log rotates at 512KB, so the spam also destroyed the evidence.
+
 ### Either side may start the conversation
 
 The device only announces itself *while it believes no session exists*. On its own that makes the
@@ -99,7 +127,55 @@ correct while you remember, and this exists for the times you forgot.
 | `layout` | `rev`, `data` | Full layout push. Device writes it to SD and rebuilds the UI |
 | `hid_exec` | `action` | Host asks the device to perform a device-local action — used to sequence mixed macros (see below) |
 | `toast` | `msg`, `lvl` | Transient on-screen message |
-| `backlight` | `v` | Brightness 0–100 |
+| `backlight` | `v` | Brightness 0–100. Only 0 vs non-zero has any effect on the board as wired — see [hardware-notes.md](hardware-notes.md) |
+| `time` | `epoch`, `tz_min` | Wall clock. Sent on connect and every 60s |
+| `power` | `state` | `"sleep"` or `"wake"` |
+
+### `time` frame
+
+```json
+{"t": "time", "epoch": 1785657600, "tz_min": -300}
+```
+
+`epoch` is seconds since 1970 **UTC**; `tz_min` is the local offset in minutes, positive east of
+Greenwich. The device has no battery-backed clock and no timezone database, so it holds the last
+value plus the `millis()` at which it arrived and does arithmetic in between.
+
+The **offset is recomputed on every send**, which is what carries a daylight-saving change across
+to a device that has no idea what one is. Until the first sync the deck renders a clock as `--:--`
+and the calendar as "waiting for the PC" — deliberately, because a wrong date looks like a bug and
+sends you looking in the wrong place.
+
+Drift between syncs is the ESP32 crystal's ~20ppm, about 1.7 seconds a day. It only matters across
+a long spell with the agent closed.
+
+### `power` frame
+
+```json
+{"t": "power", "state": "sleep"}
+```
+
+Sent when the PC suspends and resumes. The deck shows its sleep screen on `sleep`, and returns to
+the deck on `wake`, on a touch, or on any new session.
+
+**This frame is an accelerator, not a requirement — do not build anything that depends on it
+arriving.** It was originally the only way into the sleep screen, on the reasoning that a
+sleeping PC, a quit agent and an unplugged cable are indistinguishable silences and guessing
+between them would be wrong.
+
+Measured, that did not survive contact. On a Modern Standby machine, deliberately sleeping the
+laptop produces the display-off notification and Kernel-Power 506 *in the same second* — the
+agent gets no margin, its event loop is already being frozen, and the frame never goes out. The
+first real sleep test showed the deck running its ordinary idle sequence, having been told
+nothing.
+
+So the device now **also** enters the sleep screen when it would otherwise switch the backlight
+off with the link down. The ambiguity turned out not to matter: the alternative in every one of
+those cases is a black screen, and a clock beats a black screen in all of them. The frame still
+earns its place by making it *immediate* rather than waiting out `idle_off_s`.
+
+The Windows trigger is `GUID_CONSOLE_DISPLAY_STATE` rather than `PBT_APMSUSPEND`, which is later
+still. Recovering the link afterwards is a separate matter — see below.
 
 ### `stats` frame
 
@@ -216,7 +292,13 @@ name still exists.
 | `grid` | JSON | The general case. Tiles flow into `grid.cols` x `grid.rows` |
 | `numpad` | firmware | Fixed layout — expressing a ten-key as a generic grid buys nothing |
 | `stats` | firmware | Fixed layout, driven by `stats` frames |
+| `calendar` | firmware | Month view. Needs `time` for today's date; works with the agent closed once told |
 | `colortest` | firmware | Bench diagnostic: flat patches and the resolved theme values. See [editing-the-deck.md](editing-the-deck.md#the-colours-page) |
+
+An **unrecognised `type` silently becomes `grid`** on the device — the strcmp chain in
+`DeckConfig::parse()` ends with an unconditional fallback — so `"calender"` builds and navigates
+as an empty grid with nothing anywhere reporting the typo. The agent validates the list above for
+exactly that reason.
 
 ### Button fields
 

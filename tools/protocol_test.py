@@ -13,6 +13,7 @@ import re
 import sys
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ from deckhost.config import (  # noqa: E402
 )
 from deckhost.link import LinkError, SerialLink, SimulatedLink  # noqa: E402
 from deckhost.main import DeckHost  # noqa: E402
+from deckhost import main as deckhost_main  # noqa: E402
 from deckhost.stats import StatsCollector, _find_lhm_cpu_temp  # noqa: E402
 
 
@@ -314,6 +316,42 @@ class ConfigValidationTests(unittest.TestCase):
         # edited, so pinning it makes this test fail on ordinary use rather than on a defect.
         self.assertIsInstance(config.rev, int)
         self.assertGreater(config.rev, 0)
+
+    def test_unknown_page_type_rejected(self):
+        """A typo'd type silently becomes a grid on the device, so it must not reach it.
+
+        `DeckConfig::parse()` ends its strcmp chain with an unconditional `PageType::Grid`, so
+        "calender" builds and navigates as an empty grid page and nothing reports the problem.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                {"rev": 1, "pages": [{"id": "c", "type": "calender", "buttons": []}]},
+            )
+            with self.assertRaises(ConfigError) as caught:
+                DeckConfig.load(path)
+            self.assertIn("calender", str(caught.exception))
+
+    def test_known_page_types_accepted(self):
+        import tempfile
+
+        for page_type in ("grid", "numpad", "stats", "calendar"):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self._write(
+                    Path(tmp),
+                    {"rev": 1, "pages": [{"id": "p", "type": page_type, "buttons": []}]},
+                )
+                DeckConfig.load(path)  # must not raise
+
+    def test_page_without_a_type_is_a_grid(self):
+        """Omitting `type` has always meant grid; validation must not make it an error."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(Path(tmp), {"rev": 1, "pages": [{"id": "p", "buttons": []}]})
+            DeckConfig.load(path)
 
     def test_duplicate_button_id_rejected(self):
         import tempfile
@@ -919,6 +957,233 @@ class AssetSyncWarningTests(unittest.IsolatedAsyncioTestCase):
             {}, lambda _: protocol.hello(assets="000000000000")
         )
         self.assertEqual(toasts, [])
+
+
+class LinkRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """The two ways a link dies without erroring.
+
+    Both were invisible before: reads returning nothing and writes disappearing into a closed
+    port are silent, so neither failure produced an exception for the agent to react to. They
+    are caught by a clock, and these tests turn that clock down so the suite stays quick.
+    """
+
+    def setUp(self):
+        self._patches = [
+            unittest.mock.patch.object(deckhost_main, "HANDSHAKE_TIMEOUT_S", 0.3),
+            unittest.mock.patch.object(deckhost_main, "SILENCE_TIMEOUT_S", 0.3),
+            unittest.mock.patch.object(deckhost_main, "WATCHDOG_INTERVAL_S", 0.05),
+            unittest.mock.patch.object(deckhost_main, "PING_INTERVAL_S", 0.05),
+            unittest.mock.patch.object(deckhost_main, "RECONNECT_DELAY_S", 0.05),
+        ]
+        for patch in self._patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _host(self, link):
+        config = DeckConfig.load(REPO / "sdcard" / "deck.json")
+        return DeckHost(
+            link, config, ActionRunner(dry_run=True), StatsCollector(synthetic=True)
+        )
+
+    async def test_port_that_opens_but_never_handshakes_is_reopened(self):
+        """The sleep failure, exactly: COM comes back, the device does not answer on it.
+
+        Reopening rather than merely retrying is the point — a fresh serial.Serial() re-asserts
+        DTR, which is what prods the device into announcing itself. Before this the agent sent
+        identify into the void indefinitely; one morning it sat there twelve minutes.
+        """
+        link = SimulatedLink([], rev=1, step_delay=0.01, handshake=False)
+        host = self._host(link)
+
+        await host.run(duration=1.2)
+
+        self.assertFalse(host.session_up)
+        self.assertGreater(link.opens, 1, "gave up and reopened at least once")
+
+    async def test_session_that_goes_silent_is_torn_down(self):
+        """A device that handshakes and then stops answering must not stay 'connected'."""
+        link = SimulatedLink([], rev=1, step_delay=0.01, go_silent_after=2)
+        host = self._host(link)
+
+        await host.run(duration=1.2)
+
+        self.assertGreater(link.opens, 1, "ended the dead session and started a new one")
+
+    async def test_healthy_session_is_left_alone(self):
+        """The watchdog must not be trigger-happy: a deck that answers is never interrupted.
+
+        Asserted on reopen count rather than on session_up, because run() clears that flag on
+        its way out whether the session ended well or badly — so it cannot tell the two apart.
+        """
+        link = SimulatedLink([], rev=1, step_delay=0.01)
+        host = self._host(link)
+
+        await host.run(duration=1.2)
+
+        self.assertEqual(link.opens, 1, "a working link is never reopened")
+        kinds = [f["t"] for f in link.received]
+        self.assertIn("welcome", kinds, "the session really did come up")
+        self.assertIn("ping", kinds, "and kept running long enough to be pinged")
+
+    async def test_backoff_grows_then_resets_on_handshake(self):
+        host = self._host(SimulatedLink([], rev=1, step_delay=0.01))
+
+        first = host._retry_delay
+        await host._pause_before_retry(None)
+        await host._pause_before_retry(None)
+        self.assertGreater(host._retry_delay, first)
+
+        # A handshake is what proves the link works, so it is what clears the backoff. An open
+        # port is not enough — the failure this exists for is a port that opens and does nothing.
+        host._note_recovered()
+        self.assertEqual(host._retry_delay, first)
+        self.assertEqual(host._failures, 0)
+
+    async def test_backoff_is_capped(self):
+        host = self._host(SimulatedLink([], rev=1, step_delay=0.01))
+
+        for _ in range(20):
+            host._retry_delay = min(
+                host._retry_delay * 2, deckhost_main.RECONNECT_DELAY_MAX_S
+            )
+
+        self.assertLessEqual(host._retry_delay, deckhost_main.RECONNECT_DELAY_MAX_S)
+
+    async def test_wake_cuts_the_backoff_short(self):
+        """A resume is the likeliest moment for the deck to return; don't sit out the timer."""
+        host = self._host(SimulatedLink([], rev=1, step_delay=0.01))
+        host._retry_delay = 30.0
+
+        started = time.monotonic()
+        waiter = asyncio.create_task(host._pause_before_retry(None))
+        await asyncio.sleep(0.05)
+        host.on_wake()
+        await waiter
+
+        self.assertLess(time.monotonic() - started, 1.0)
+
+
+class TimeSyncTests(unittest.TestCase):
+    """The deck has no RTC, so this frame is the only thing that makes its clock true."""
+
+    def test_carries_epoch_and_offset(self):
+        frame = protocol.time_sync()
+
+        self.assertEqual(frame["t"], "time")
+        self.assertGreater(frame["epoch"], 1_700_000_000)  # sometime after 2023
+        self.assertIsInstance(frame["tz_min"], int)
+        self.assertGreaterEqual(frame["tz_min"], -12 * 60)
+        self.assertLessEqual(frame["tz_min"], 14 * 60)
+
+    def test_offset_is_whole_minutes(self):
+        """Some zones are on a half hour, none are on a fraction of a minute."""
+        self.assertEqual(protocol.time_sync()["tz_min"] % 1, 0)
+
+    def test_offset_recomputed_per_call(self):
+        """Sent fresh every minute so a daylight-saving change carries across.
+
+        The device has no timezone database and cannot work out that the clocks went forward;
+        it only knows what it was last told, so the offset must not be cached here.
+        """
+        import time as _time
+
+        january = protocol.time_sync(_time.mktime((2026, 1, 15, 12, 0, 0, 0, 0, -1)))
+        july = protocol.time_sync(_time.mktime((2026, 7, 15, 12, 0, 0, 0, 0, -1)))
+
+        # Equal in a zone without DST, different in one with it — either is correct, so this
+        # asserts only that each was derived from its own timestamp rather than from "now".
+        self.assertNotEqual(january["epoch"], july["epoch"])
+
+    def test_power_frame_shape(self):
+        self.assertEqual(protocol.power("sleep"), {"t": "power", "state": "sleep"})
+        self.assertEqual(protocol.power("wake"), {"t": "power", "state": "wake"})
+
+
+class PowerEventTests(unittest.TestCase):
+    """Edge detection, which is the whole job once the window exists.
+
+    Windows announces the same transition more than one way — a display-off arrives, then a
+    PBT_APMSUSPEND for the same sleep — so the monitor must report edges, not messages, or the
+    deck gets told to sleep twice and the agent reconnects twice on the way back.
+    """
+
+    def _monitor(self):
+        from deckhost.power import PowerMonitor
+
+        events = []
+        monitor = PowerMonitor(
+            on_sleep=lambda: events.append("sleep"),
+            on_wake=lambda: events.append("wake"),
+        )
+        return monitor, events
+
+    def test_sleep_then_wake(self):
+        monitor, events = self._monitor()
+        monitor.on_display_state(0)
+        monitor.on_display_state(1)
+        self.assertEqual(events, ["sleep", "wake"])
+
+    def test_repeated_signals_report_one_edge(self):
+        from deckhost.power import PBT_APMSUSPEND
+
+        monitor, events = self._monitor()
+        monitor.on_display_state(0)
+        monitor._on_broadcast(PBT_APMSUSPEND, 0, None)
+        monitor.on_display_state(0)
+        self.assertEqual(events, ["sleep"])
+
+    def test_wake_without_sleep_is_ignored(self):
+        monitor, events = self._monitor()
+        monitor.on_display_state(1)
+        self.assertEqual(events, [])
+
+    def test_dimmed_display_is_not_sleep(self):
+        """State 2 means the screen dimmed and the user is still there."""
+        monitor, events = self._monitor()
+        monitor.on_display_state(2)
+        self.assertEqual(events, [])
+
+    def test_apm_messages_are_a_backstop(self):
+        from deckhost.power import PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND
+
+        monitor, events = self._monitor()
+        monitor._on_broadcast(PBT_APMSUSPEND, 0, None)
+        monitor._on_broadcast(PBT_APMRESUMEAUTOMATIC, 0, None)
+        self.assertEqual(events, ["sleep", "wake"])
+
+    def test_raising_callback_does_not_kill_the_pump(self):
+        """A failed callback must not cost every later power event."""
+        from deckhost.power import PowerMonitor
+
+        def boom():
+            raise RuntimeError("callback exploded")
+
+        monitor = PowerMonitor(on_sleep=boom, on_wake=boom)
+        with self.assertLogs("deckhost.power", level="ERROR"):
+            monitor.on_display_state(0)
+
+        self.assertTrue(monitor._asleep, "the edge still counted")
+
+
+class PortDiscoveryTests(unittest.TestCase):
+    def test_autodetected_port_is_rediscovered_each_open(self):
+        """Caching the discovered port is what made a COM renumber unrecoverable.
+
+        open() used to write its find back into self.port, so `self.port or self.discover()`
+        short-circuited from then on. When Windows moved the deck after a suspend, the agent
+        reopened a port that no longer existed until it was restarted — 1273 times in one
+        overnight run.
+        """
+        link = SerialLink()
+        self.assertFalse(link._pinned)
+
+        link.port = "COM6"  # as if a previous open had found this one
+        self.assertFalse(link._pinned, "discovery must stay live")
+
+    def test_explicit_port_is_honoured(self):
+        link = SerialLink("COM9")
+        self.assertTrue(link._pinned)
+        self.assertEqual(link.port, "COM9")
 
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):

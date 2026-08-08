@@ -1,10 +1,18 @@
 # Beta complete — where the project stopped, and what is left
 
-**Status as of 2026-08-02: firmware `0.5.4`, layout `rev 9`, 77 tests passing.**
+**Status as of 2026-08-02: firmware `0.6.0`, layout `rev 13`, 98 tests passing.**
 
-The deck is feature-complete enough to live on the desk. Development is paused deliberately, to
-use it for a while and gather real UI/UX feedback before building more — because most of what is
-left is polish, and polish decided from a chair is usually decided wrong.
+The deck is feature-complete enough to live on the desk. Development paused after the visual
+design pass to gather real UI/UX feedback — then resumed for one round of exactly that, after
+sleep turned out to break the link permanently:
+
+- **The link now recovers from sleep.** The port always came back on wake; the handshake did
+  not, and nothing had a deadline on it. See the session-lifecycle section of
+  [protocol.md](protocol.md) — that table of three timeouts is the fix.
+- **Idle dimming works**, having never worked at all. The backlight is on/off only, so it dims
+  by drawing dark. [hardware-notes.md](hardware-notes.md) has the finding and the rewire that
+  makes it real.
+- **A sleep clock and a calendar**, both off the back of the deck now knowing what time it is.
 
 This file exists so picking the work back up costs minutes, not an afternoon of rereading code.
 
@@ -24,8 +32,12 @@ The original build plan's **Phases 0–5** and the whole **visual design pass (S
 | Icons | 61 LVGL symbols by name, plus MDI1 images from SD |
 | Tile anatomy | `icon_text` / `icon` / `text`, resolved button → theme → `settings` |
 | Stats page | Four cards, themed arcs and chart |
-| Fonts | Montserrat (tiles, nav, **all icons**), Nord Medium 40 (ten-key), Century Gothic (stats) |
+| Fonts | Montserrat (tiles, nav, **all icons**), Nord Medium 40 (ten-key), Century Gothic (stats, sleep clock) |
 | Asset stamp | Card-vs-repo hash compared on connect, warns when the card is stale |
+| Link recovery | Handshake, silence and reopen deadlines; port re-enumerated every attempt |
+| Power awareness | Agent tells the deck when the PC sleeps and wakes |
+| Idle | Overlay dim, then backlight off; first touch only wakes |
+| Clock + calendar | Time synced each minute; sleep clock and a month view |
 
 Two guards worth remembering, because they exist to stop expensive bugs recurring:
 
@@ -35,6 +47,9 @@ Two guards worth remembering, because they exist to stop expensive bugs recurrin
 - `UsbLink::rawWrite()` **must not gate on `availableForWrite()`**. That was a hard 64-byte
   ceiling on every frame, and `hello` sat at exactly 64. See
   [hardware-notes.md](hardware-notes.md).
+- **Never end a session on an error alone — both ends need a clock.** Reads that return nothing
+  and writes into a closed port are silent, so a link can die without either side being told.
+  Three deadlines, listed in [protocol.md](protocol.md).
 
 ---
 
@@ -62,19 +77,29 @@ Things worth paying attention to specifically:
 
 Ordered by value-for-effort, not by ambition.
 
-### 1. Nav-bar clock — small
+### 1. PWM backlight — the rewire *(committed to, not merely considered)*
 
-The agent already pushes a `stats` frame every second; add `time` to it and the nav bar's empty
-right-hand third earns its space. Hides itself when the agent is closed, like every other
-agent-dependent element.
+The one item here that is definitely happening. The backlight enable is a bare on/off line on
+CH422G EXIO2; moving it to **GPIO15 or GPIO16** under LEDC makes `brightness`, `dim_pct` and the
+`backlight` frame literal instead of approximate.
 
-*Touches:* `agent/deckhost/stats.py`, `ui_builder.cpp` (nav build), `docs/protocol.md`.
+Firmware is `MD_BACKLIGHT_PWM_GPIO` in `config.h` plus an LEDC branch in
+`board_port::setBacklight()` — **one file**, because every layer above it already passes
+percentages rather than booleans. Nothing built in this round should need rewriting; if it does,
+the two-knob split was got wrong.
+
+Check the Waveshare schematic before cutting: whether the driver's enable input tolerates PWM at
+LEDC rates, and whether EXIO2 gates anything else, decides where the trace comes off. Record what
+the board turns out to do in [hardware-notes.md](hardware-notes.md).
+
+*Touches:* `board_port.cpp`, `config.h`.
 
 ### 2. Slimmer nav — small
 
-`NAV_H` is 56 px: 12% of the screen for four tabs. Icon-only tabs would roughly halve it and give
-every page the space back. The icon machinery from S3 already exists — a tab is just a label, so
-`icons::symbol()` works there unchanged.
+`NAV_H` is 56 px: 12% of the screen, now for **five** tabs. Icon-only tabs would roughly halve it
+and give every page the space back. The icon machinery from S3 already exists — a tab is just a
+label, so `icons::symbol()` works there unchanged. More pressing than it was: six tabs is where
+the current bar runs out of room before the status dot.
 
 *Touches:* `theme.h` (`NAV_H`), `ui_builder.cpp`, `deck_config.{h,cpp}` (a page needs an `icon`).
 
@@ -131,14 +156,14 @@ device sits on a desk beside the laptop it drives.
 - **Nord Medium 10/12/26/30/42/44** are unconverted. Only 14/20/28/40 have a same-size Montserrat
   to fall back on, which matters because Nord has no space glyph.
 - **Geoform Bold** exists only as a 72 px VLW — too large for anything in this UI.
-- **Four settings are parsed but never used.** Found while writing the README user guide, so the
-  guide documents the real behaviour rather than the intended one:
-  - `settings.idle_off_s` — the backlight dims to 10% after `idle_dim_s` and never switches off.
-    Either implement it in `ui::tick()` beside the dim check, or drop the field.
-  - `MD_LONG_PRESS_MS` (600), `MD_KEY_REPEAT_DELAY_MS` (400) and `MD_KEY_REPEAT_RATE_MS` (60) in
-    `config.h` are dead. The real values are LVGL's indev defaults — **400 ms** to hold and
-    100 ms between repeats — because nothing calls `lv_indev_set_long_press_time()`. Wire them
-    up or delete them; right now they document timings that are not in force.
+- **Three settings are parsed but never used.** `MD_LONG_PRESS_MS` (600),
+  `MD_KEY_REPEAT_DELAY_MS` (400) and `MD_KEY_REPEAT_RATE_MS` (60) in `config.h` are dead. The
+  real values are LVGL's indev defaults — **400 ms** to hold and 100 ms between repeats —
+  because nothing calls `lv_indev_set_long_press_time()`. Wire them up or delete them; right now
+  they document timings that are not in force.
+
+  (`settings.idle_off_s` was the fourth. It now switches the backlight off, which is the one
+  thing the backlight can genuinely do.)
 
 ---
 
@@ -157,13 +182,21 @@ Recorded so they are not re-litigated.
 - **Opaque stats page.** The plan called for it on cost grounds; the arithmetic does not hold
   (~150k px/s against a 384k full frame) and it would hide the wallpaper on the largest page.
   The real readability problem — a hairline chart trace over a photo — is fixed on the trace.
+- **Nav-bar clock.** The laptop screen has one two feet away. A clock earns its place on the
+  *sleep* screen, where the alternative is a blank lit panel — and that is where it went.
+- **Inferring sleep from link silence.** A sleeping PC, a quit agent and an unplugged cable are
+  the same thing from the device's side. Guessing would turn "I closed the tray icon" into a
+  deck that became a clock, so the agent announces it explicitly instead.
+- **Detecting suspend by watching for a jump in the wall clock.** The usual trick, and useless
+  here: this laptop has only Modern Standby, so the agent is never frozen and there is no jump
+  to see.
 
 ---
 
 ## Picking this back up
 
 1. Read the feedback log above first. It is the only new information.
-2. `python tools/protocol_test.py` — 77 tests, no hardware needed.
+2. `python tools/protocol_test.py` — 98 tests, no hardware needed.
 3. Flash and watch port A (COM4, 115200). A healthy boot ends with `[main] ready` then
    `[link] session up`. The exact compile command is in the README under
    *Compile check without the IDE*.

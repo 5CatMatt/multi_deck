@@ -27,6 +27,16 @@ extern const lv_font_t md_font_century_20;
 extern const lv_font_t md_font_century_28;
 extern const lv_font_t md_font_century_40;
 
+// The sleep clock, same face at 96px but carrying only `0123456789:`:
+//
+//   python tools/make_font.py C:/Windows/Fonts/GOTHIC.TTF --name centuryclock --sizes 96 \
+//       --chars "0123456789:" --fallback lv_font_montserrat_40
+//
+// Subset because bitmap cost grows with the square of the size — the full ASCII range at 96px
+// is ~180KB of flash, these eleven glyphs are ~20KB. It falls back to Montserrat 40 rather than
+// to nothing, so a label that unexpectedly contains a letter comes out small instead of blank.
+extern const lv_font_t md_font_centuryclock_96;
+
 // Nord Medium, transcoded from the TFT_eSPI .vlw files in fonts/. Only the 40px is in use, for
 // the ten-key — see the note on FONT_PAD in theme.cpp. The other three stay declared because
 // the linker's --gc-sections drops an unreferenced font entirely, so they cost nothing until a

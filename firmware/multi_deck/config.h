@@ -8,7 +8,7 @@
 // Bump this with any behavioural firmware change. It rides along in the `hello` frame and the
 // agent logs it on connect, so "which build is actually on the device?" is answered by looking
 // rather than by remembering.
-#define MD_FW_VERSION    "0.5.4"
+#define MD_FW_VERSION    "0.6.0"
 #define MD_DEVICE_NAME   "multi_deck"
 #define MD_PROTO_VERSION 1
 

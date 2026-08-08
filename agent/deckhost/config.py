@@ -41,6 +41,13 @@ COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
 THEME_DISPLAY_VALUES = frozenset({"icon_text", "icon", "text"})
 
+# Page types the firmware knows, mirroring the strcmp chain in DeckConfig::parse().
+#
+# Worth validating because the firmware's fallback for an unrecognised type is `grid` — and a
+# `"type": "calender"` typo therefore produces a page that builds, navigates and renders as an
+# empty grid, with nothing anywhere saying the type was ignored.
+PAGE_TYPES = frozenset({"grid", "numpad", "stats", "calendar", "colortest"})
+
 # LVGL built-in symbols the firmware can render, mirroring kIcons in
 # firmware/multi_deck/icons.cpp. The naming rule there is mechanical — the LV_SYMBOL_ name
 # lowercased — so this list is the same list, not a translation of it.
@@ -155,6 +162,13 @@ class DeckConfig:
         seen: set[str] = set()
 
         for page in self.raw.get("pages", []):
+            page_type = page.get("type", "grid")
+            if page_type not in PAGE_TYPES:
+                problems.append(
+                    f"page {page.get('id')!r}: type is {page_type!r}, expected one of "
+                    f"{', '.join(sorted(PAGE_TYPES))}"
+                )
+
             for button in page.get("buttons", []):
                 button_id = button.get("id")
 

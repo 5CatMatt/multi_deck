@@ -56,6 +56,16 @@ class SerialLink(Link):
         # Created in open(), where a running event loop is guaranteed.
         self._write_lock: asyncio.Lock | None = None
 
+        # Whether the caller named a port, as opposed to us having found one.
+        #
+        # This distinction is the whole point: open() used to cache whatever it discovered into
+        # self.port, so `self.port or self.discover()` short-circuited from then on and the
+        # autodetect never ran again. Windows is free to hand the deck a different COM number
+        # after a suspend or a re-enumeration, and when it did, the agent spent the rest of its
+        # life reopening a port that no longer existed. One overnight run logged 1273 identical
+        # failures against a stale COM6.
+        self._pinned = port is not None
+
     @staticmethod
     def discover() -> str | None:
         """Finds the deck by USB vendor id, preferring a matching product string."""
@@ -81,7 +91,10 @@ class SerialLink(Link):
     async def open(self) -> None:
         import serial
 
-        port = self.port or self.discover()
+        # Re-enumerate every time unless the caller pinned a port with --port. Discovery is a
+        # registry walk costing a millisecond or two, and it is the only thing that lets the
+        # agent follow the deck to a new COM number by itself.
+        port = self.port if self._pinned else self.discover()
         if port is None:
             raise RuntimeError(
                 "no deck found — is it plugged into the native USB port (port B)?"
@@ -92,6 +105,9 @@ class SerialLink(Link):
         )
         self._write_lock = asyncio.Lock()
         self._open = True
+
+        if port != self.port and self.port is not None:
+            log.info("deck moved from %s to %s", self.port, port)
         self.port = port
         log.info("serial link open on %s", port)
 
@@ -156,21 +172,47 @@ class SimulatedLink(Link):
         *,
         rev: int = 0,
         step_delay: float = 0.4,
+        handshake: bool = True,
+        go_silent_after: int | None = None,
     ) -> None:
         self.script = script or []
         self.rev = rev
         self.step_delay = step_delay
 
+        # Two ways of being broken that a real deck manages and a naive fake cannot, both of
+        # which the agent was once blind to. `handshake=False` is a port that opens and then
+        # says nothing — what a laptop waking from Modern Standby produces. `go_silent_after`
+        # is a device that handshakes normally and then stops answering, which is what an
+        # unplugged cable looks like from inside a session.
+        self.handshake = handshake
+        self.go_silent_after = go_silent_after
+
         self._outbound: asyncio.Queue[bytes] = asyncio.Queue()
         self._reader = protocol.FrameReader()
         self._closed = False
         self._script_task: asyncio.Task[None] | None = None
+        self._reactions = 0
 
         # What the agent sent us, for assertions in tests.
         self.received: list[dict[str, Any]] = []
         self.hid_exec_calls: list[dict[str, Any]] = []
+        self.opens = 0
 
     async def open(self) -> None:
+        # Reset per-session state, because the agent reopens a link it has given up on and a
+        # fake that cannot be reopened would make those paths untestable.
+        self._closed = False
+        self._reader = protocol.FrameReader()
+        self._reactions = 0
+        while not self._outbound.empty():
+            self._outbound.get_nowait()
+
+        self.opens += 1
+
+        if not self.handshake:
+            log.info("simulated deck attached but will not handshake")
+            return
+
         await self._outbound.put(protocol.encode(protocol.hello(fw="sim", rev=self.rev)))
         log.info("simulated deck attached (layout rev %d)", self.rev)
 
@@ -182,6 +224,16 @@ class SimulatedLink(Link):
     async def write(self, data: bytes) -> None:
         for frame in self._reader.feed(data):
             self.received.append(frame)
+
+            # Still recorded, just never answered — a device that has stopped talking has not
+            # stopped being written to, and the agent must notice by the clock rather than by
+            # an error.
+            if self.go_silent_after is not None and self._reactions >= self.go_silent_after:
+                continue
+            if not self.handshake:
+                continue
+
+            self._reactions += 1
             await self._react(frame)
 
     async def _react(self, frame: dict[str, Any]) -> None:

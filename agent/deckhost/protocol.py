@@ -106,6 +106,34 @@ def backlight(value: int) -> dict[str, Any]:
     return {"t": "backlight", "v": max(0, min(100, int(value)))}
 
 
+def time_sync(now: float | None = None) -> dict[str, Any]:
+    """The wall clock, for a board with no battery-backed RTC.
+
+    The UTC offset is sent rather than a timezone name because the device carries no timezone
+    database — it cannot work out that it is in daylight saving, so it is told. Recomputed on
+    every send, which is what makes the deck follow a DST change without knowing what one is.
+    """
+    import time as _time
+    from datetime import datetime
+
+    stamp = _time.time() if now is None else now
+    offset = datetime.fromtimestamp(stamp).astimezone().utcoffset()
+    tz_min = int(offset.total_seconds() // 60) if offset else 0
+
+    return {"t": "time", "epoch": int(stamp), "tz_min": tz_min}
+
+
+def power(state: str) -> dict[str, Any]:
+    """Tells the deck what the PC is doing. `state` is "sleep" or "wake".
+
+    Sent rather than inferred, because the deck cannot tell a sleeping PC from a closed agent
+    or an unplugged cable by looking at the link — all three are simply silence. Only an
+    explicit announcement should put the deck into its sleep screen; silence on its own keeps
+    today's behaviour of greying the status dot and nothing more.
+    """
+    return {"t": "power", "state": state}
+
+
 def stats(sample: dict[str, Any]) -> dict[str, Any]:
     return {"t": "stats", **sample}
 

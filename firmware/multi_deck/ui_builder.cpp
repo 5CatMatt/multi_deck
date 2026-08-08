@@ -6,10 +6,13 @@
 
 #include "assets.h"
 #include "board_port.h"
+#include "calendar_view.h"
 #include "color_test.h"
 #include "config.h"
+#include "device_time.h"
 #include "hid.h"
 #include "icons.h"
+#include "sleep_view.h"
 #include "stats_view.h"
 #include "theme.h"
 
@@ -35,7 +38,18 @@ String g_current_page;
 bool g_link_up = false;
 uint32_t g_toast_until = 0;
 uint8_t g_brightness = 80;
-bool g_dimmed = false;
+
+// Idle progression. Awake -> Dimmed -> Off, and any touch goes straight back to Awake.
+//
+// Each state sets the backlight *and* the overlay. The backlight half is currently a no-op
+// above zero — see the note on Settings in deck_config.h — but it is still called with a real
+// percentage, so rewiring the backlight for PWM changes board_port.cpp and nothing here.
+enum class Idle : uint8_t { Awake, Dimmed, Off };
+Idle g_idle = Idle::Awake;
+
+// Full-screen veil. Present whenever the theme asks for less than full brightness, which is
+// why it is not simply created on the way into Dimmed.
+lv_obj_t *g_dim_overlay = nullptr;
 
 // Binding for one tile. Heap-allocated and owned by g_bindings so the pointer handed to
 // LVGL as user data stays valid regardless of container growth.
@@ -56,6 +70,112 @@ struct PadKey {
 void clearBindings() {
   for (auto *binding : g_bindings) delete binding;
   g_bindings.clear();
+}
+
+uint8_t clampPercent(int value) {
+  if (value < 0) return 0;
+  if (value > 100) return 100;
+  return static_cast<uint8_t>(value);
+}
+
+void applyIdle();
+
+void onDimOverlayClick(lv_event_t *) {
+  // Waking here rather than leaving it to the next tick() is what makes the first touch feel
+  // like a wake rather than a lag. The overlay being clickable is also what stops that touch
+  // reaching the tile underneath — nobody wants the tap that woke the screen to also fire a
+  // macro they cannot see.
+  g_idle = Idle::Awake;
+  applyIdle();
+}
+
+void ensureDimOverlay() {
+  if (g_dim_overlay != nullptr) return;
+
+  g_dim_overlay = lv_obj_create(g_screen);
+  lv_obj_remove_style_all(g_dim_overlay);
+  lv_obj_set_size(g_dim_overlay, MD_SCREEN_W, MD_SCREEN_H);
+  lv_obj_set_pos(g_dim_overlay, 0, 0);
+  lv_obj_set_style_bg_color(g_dim_overlay, lv_color_black(), 0);
+  lv_obj_remove_flag(g_dim_overlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(g_dim_overlay, onDimOverlayClick, LV_EVENT_CLICKED, nullptr);
+}
+
+// `veil` is 0-100. `absorb_touch` decides whether the overlay is a filter you can press
+// through or a lid you have to lift first.
+void setDimOverlay(uint8_t veil, bool absorb_touch) {
+  if (veil == 0 && g_dim_overlay == nullptr) return;
+
+  ensureDimOverlay();
+  lv_obj_set_style_bg_opa(g_dim_overlay, veil * 255 / 100, 0);
+
+  if (veil == 0) {
+    lv_obj_add_flag(g_dim_overlay, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_remove_flag(g_dim_overlay, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // lv_obj_create() sets LV_OBJ_FLAG_CLICKABLE, so a resting veil would silently eat every tap
+  // on the deck if this were left alone. Removing it is not tidying — it is the difference
+  // between a working deck and a dead one.
+  if (absorb_touch) {
+    lv_obj_add_flag(g_dim_overlay, LV_OBJ_FLAG_CLICKABLE);
+  } else {
+    lv_obj_remove_flag(g_dim_overlay, LV_OBJ_FLAG_CLICKABLE);
+  }
+
+  lv_obj_move_foreground(g_dim_overlay);
+}
+
+// Drives both brightness knobs for the current idle state. See the note on Settings in
+// deck_config.h for why there are two and why neither is written around the other.
+void applyIdle() {
+  if (g_config == nullptr) return;
+
+  const Settings &settings = g_config->settings;
+
+  uint8_t backlight = g_brightness;
+  uint8_t veil = 0;
+  bool absorb_touch = false;
+
+  switch (g_idle) {
+    case Idle::Awake:
+      // No veil at rest, deliberately.
+      //
+      // This briefly painted `100 - brightness` here so that `brightness` would have a visible
+      // effect before the backlight is rewired for PWM. That was wrong: brightness had never
+      // done anything, so every existing theme suddenly went 20% darker on flashing, and on a
+      // near-black theme like Stars (#060A12 under a dark wallpaper) the panel read as simply
+      // off. Making a dead setting live is not worth changing how every deck already looks.
+      //
+      // `brightness` still goes to setBacklight() below, where it becomes real the day the
+      // backlight moves to a GPIO. The overlay's job is the idle stages, and only those.
+      break;
+
+    case Idle::Dimmed:
+      backlight = clampPercent(settings.dim_pct);
+      veil = theme::current().dim_opa;
+      absorb_touch = true;
+      break;
+
+    case Idle::Off:
+      // The one thing the expander-driven backlight genuinely does. The veil stays set so that
+      // waking does not flash a bright screen for a frame before the overlay catches up.
+      backlight = 0;
+      veil = theme::current().dim_opa;
+      absorb_touch = true;
+      break;
+  }
+
+  // Logged on every application, not only on change. The idle machine is the one thing here
+  // that can make the panel look dead, and a black screen with a silent log is exactly the
+  // failure that is impossible to tell apart from a crash.
+  static const char *const kNames[] = {"awake", "dimmed", "off"};
+  MD_LOG.printf("[ui] idle=%s backlight=%u veil=%u\n", kNames[static_cast<int>(g_idle)],
+                backlight, veil);
+
+  board_port::setBacklight(backlight);
+  setDimOverlay(veil, absorb_touch);
 }
 
 void executeAction(const Action &action);
@@ -414,15 +534,22 @@ bool begin(DeckConfig *config, Link *link) {
 
   if (!config->pages.empty()) g_current_page = config->pages[0].id;
 
-  // rebuild() builds the theme styles, so nothing here needs to touch appearance.
+  // rebuild() builds the theme styles and ends by applying the idle state, which is what sets
+  // the backlight — so there is nothing to do here afterwards.
   rebuild();
-  board_port::setBacklight(g_brightness);
   return true;
 }
 
 void rebuild() {
+  // A layout push or a theme change can land while the PC is asleep, and lv_obj_clean() below
+  // takes the clock down with everything else. Remembered here and restored at the end, so a
+  // rebuild during the night does not leave the deck showing a bright grid nobody is looking at.
+  const bool was_asleep = sleep_view::isActive();
+
   clearBindings();
   stats_view::detach();
+  calendar_view::detach();
+  sleep_view::detach();
   lv_obj_clean(g_screen);
 
   // lv_obj_clean() destroyed every child, so each cached handle now points at freed memory.
@@ -435,6 +562,7 @@ void rebuild() {
   g_nav = nullptr;
   g_content = nullptr;
   g_status_dot = nullptr;
+  g_dim_overlay = nullptr;
 
   // theme::apply() calls lv_style_reset(), which frees the property arrays that live objects
   // point into — so the screen must be stripped of its style *before* the rebuild, and the
@@ -444,11 +572,7 @@ void rebuild() {
   theme::apply(g_config->theme());
   lv_obj_add_style(g_screen, &theme::screen, 0);
 
-  const uint8_t wanted = static_cast<uint8_t>(g_config->settings.brightness);
-  if (wanted != g_brightness) {
-    g_brightness = wanted;
-    if (!g_dimmed) board_port::setBacklight(g_brightness);
-  }
+  g_brightness = clampPercent(g_config->settings.brightness);
   board_port::setRotation180(g_config->theme().flip180);
 
   g_content = lv_obj_create(g_screen);
@@ -475,6 +599,9 @@ void rebuild() {
       case PageType::Stats:
         stats_view::build(g_content);
         break;
+      case PageType::Calendar:
+        calendar_view::build(g_content);
+        break;
       case PageType::ColorTest:
         color_test::build(g_content, *g_config);
         break;
@@ -482,6 +609,17 @@ void rebuild() {
   }
 
   buildNav();
+
+  // lv_obj_clean() above destroyed the overlay along with everything else, so it is rebuilt
+  // here — and it must come after every other child, because it draws over all of them.
+  // Re-applying rather than merely re-creating matters: a rebuild triggered while the screen
+  // was dimmed (a layout push, or the agent connecting) would otherwise come back at full
+  // brightness with the idle state still claiming to be dimmed.
+  applyIdle();
+
+  // Above the overlay, because the sleep screen supplies its own darkness and being veiled
+  // twice would make the clock unreadable.
+  if (was_asleep) enterSleep();
 
   // After buildNav(), because toast() creates an object on the screen and rebuild() would
   // otherwise destroy it. takeError() clears as it reads, so a page change does not re-toast
@@ -499,7 +637,10 @@ void releaseConfigReferences() {
   g_nav = nullptr;
   g_content = nullptr;
   g_status_dot = nullptr;
+  g_dim_overlay = nullptr;
   stats_view::detach();
+  calendar_view::detach();
+  sleep_view::detach();
 }
 
 void showPage(const String &id) {
@@ -514,7 +655,37 @@ void showPage(const String &id) {
 void setLinkUp(bool up) {
   if (up == g_link_up) return;
   g_link_up = up;
+
+  // A new session means the PC is demonstrably awake, whatever it said last. This is what
+  // stops an agent quitting mid-sleep from stranding the deck on its clock forever: the state
+  // is cleared by evidence, not only by the frame that is supposed to clear it.
+  if (up) leaveSleep();
+
   rebuild();
+}
+
+void enterSleep() {
+  if (sleep_view::isActive()) return;
+
+  sleep_view::enter(g_screen, [](lv_event_t *) { leaveSleep(); });
+
+  // Full backlight would defeat the point, and the sleep screen draws its own darkness, so the
+  // idle overlay is not wanted on top of it. Dropping to the dim backlight level keeps the
+  // clock readable now and gets genuinely dark once the backlight has PWM.
+  board_port::setBacklight(clampPercent(g_config->settings.dim_pct));
+  if (g_dim_overlay != nullptr) lv_obj_add_flag(g_dim_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+void leaveSleep() {
+  if (!sleep_view::isActive()) return;
+
+  sleep_view::leave();
+
+  // Straight back to Awake rather than to whatever the idle timer thinks. The touch that
+  // dismissed the clock has already reset LVGL's inactivity counter, and a user who just woke
+  // the deck deliberately should not find it dim.
+  g_idle = Idle::Awake;
+  applyIdle();
 }
 
 // `target` is "next", "prev", or a theme name. Runs entirely on the device — no agent
@@ -565,12 +736,58 @@ void tick() {
     g_toast = nullptr;
   }
 
-  const uint32_t idle_ms = lv_display_get_inactive_time(nullptr);
-  const bool should_dim = idle_ms > (uint32_t)g_config->settings.idle_dim_s * 1000UL;
+  sleep_view::tick();
+  calendar_view::tick();
 
-  if (should_dim != g_dimmed) {
-    g_dimmed = should_dim;
-    board_port::setBacklight(should_dim ? 10 : g_brightness);
+  // The idle timer is meaningless while the sleep screen is up: it is already as dark as it
+  // gets, and letting Off fire underneath would blank the clock the PC just asked us to show.
+  if (sleep_view::isActive()) return;
+
+  const uint32_t idle_ms = lv_display_get_inactive_time(nullptr);
+  const Settings &settings = g_config->settings;
+
+  // Off is tested first so that an idle_off_s below idle_dim_s still reaches Off rather than
+  // sticking at Dimmed. Either interval at zero means "never", which is how you turn one stage
+  // off without having to pick a number large enough to never arrive.
+  Idle wanted = Idle::Awake;
+  if (settings.idle_off_s > 0 && idle_ms > (uint32_t)settings.idle_off_s * 1000UL) {
+    wanted = Idle::Off;
+  } else if (settings.idle_dim_s > 0 && idle_ms > (uint32_t)settings.idle_dim_s * 1000UL) {
+    wanted = Idle::Dimmed;
+  }
+
+  // A dark panel with the PC away is a wasted panel — show the clock instead.
+  //
+  // The `power` frame is the fast path, not the only one, because it cannot be relied on to
+  // arrive. Measured on this laptop: display-off and "entering Modern Standby" land in the same
+  // second when you sleep it deliberately, so the agent gets no margin to send anything and the
+  // event loop is already being frozen. Waiting to be told meant never being told.
+  //
+  // The link being down covers a sleeping PC, a closed agent and an unplugged cable alike. That
+  // ambiguity was the reason for insisting on an announcement in the first place, and it turns
+  // out not to matter here: the alternative in every one of those cases is a black screen, and a
+  // clock beats a black screen in all of them. It stays a deliberate announcement for entering
+  // *early* — the difference is that this no longer needs one to happen at all.
+  if (wanted == Idle::Off && !g_link_up) {
+    if (device_time::valid()) {
+      enterSleep();
+      return;
+    }
+
+    // Reaching the off stage with no clock to show is worth saying once, because from the front
+    // of the device it is indistinguishable from the feature not existing. It means no `time`
+    // frame has arrived since power-up — the deck has no RTC, so a deck that has never seen the
+    // agent genuinely cannot show a clock.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      MD_LOG.println("[ui] would show the sleep clock, but no time sync has arrived yet");
+    }
+  }
+
+  if (wanted != g_idle) {
+    g_idle = wanted;
+    applyIdle();
   }
 }
 

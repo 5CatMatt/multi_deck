@@ -89,14 +89,17 @@ to show something specific before the agent ever connects.
     "ok":         "#3fb950",    // status dot, agent connected
     "idle":       "#6e7681",    // status dot, agent absent
 
+    "dim_opa":    55,           // how dark the idle veil goes, 0-100
+
     "flip180":    true          // mount the deck the other way up
   }
 ],
 "settings": {
   "theme":      "Midnight",     // which one to start on; omit for the first
   "brightness": 80,             // 0-100, applied on reload
-  "idle_dim_s": 60,             // dim the backlight after this many idle seconds
-  "idle_off_s": 300
+  "idle_dim_s": 60,             // dim after this many idle seconds; 0 to never dim
+  "idle_off_s": 300,            // screen off after this many; 0 to never switch off
+  "dim_pct":    15              // backlight level while dimmed
 }
 ```
 
@@ -305,8 +308,18 @@ question you answer by looking rather than by inferring from the panel.
 - **A disabled tile no longer fades the whole button.** It keeps its fill and moves the label to
   `text_muted`, so make sure `text_muted` is legible on `tile` — otherwise closing the agent makes
   half the deck unreadable rather than merely dimmed.
-- **`brightness` interacts with idle dimming.** After `idle_dim_s` the backlight drops to 10%
-  regardless, so wake the screen before judging a brightness change.
+- **`brightness` does nothing yet, and that is deliberate.** The backlight on this board is a
+  bare on/off line on the CH422G expander with no PWM in the path, so every non-zero value is
+  identical. It is still sent to the backlight honestly, and becomes literal the day that wire
+  moves to a GPIO — see [hardware-notes.md](hardware-notes.md).
+
+  It briefly darkened the screen in software to make itself visible. That was a mistake and was
+  reverted: brightness had never had an effect, so making it live meant every existing theme
+  went 20% darker on flashing, and on a near-black theme the panel just read as off. **A dead
+  setting coming alive should not change how a deck already looks.**
+- **`dim_opa` is the idle veil**, and belongs to the theme rather than to settings because a
+  pale theme needs a heavier veil than a dark one to read as equally dimmed. It applies only
+  after `idle_dim_s`, never at rest. Wake the screen before judging a colour change.
 - **Judge a colour against a neutral background.** A grey patch surrounded by blue reads as
   yellow-olive — ordinary simultaneous contrast, and a good way to chase a bug that is not there.
   The Colours page exists for this; switch to Paper before trusting what you see on a dark theme.

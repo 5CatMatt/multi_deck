@@ -15,9 +15,11 @@
 #include "board_port.h"
 #include "config.h"
 #include "deck_config.h"
+#include "device_time.h"
 #include "hid.h"
 #include "link.h"
 #include "lvgl_v9_port.h"
+#include "sleep_view.h"
 #include "stats_view.h"
 #include "ui_builder.h"
 
@@ -87,6 +89,15 @@ void onFrame(JsonObjectConst frame) {
     ui::toast(String(frame["msg"] | ""));
   } else if (strcmp(type, "backlight") == 0) {
     board_port::setBacklight(frame["v"] | 80);
+  } else if (strcmp(type, "time") == 0) {
+    device_time::set(frame["epoch"] | 0LL, frame["tz_min"] | 0);
+  } else if (strcmp(type, "power") == 0) {
+    const char *state = frame["state"] | "";
+    if (strcmp(state, "sleep") == 0) {
+      ui::enterSleep();
+    } else {
+      ui::leaveSleep();
+    }
   } else {
     MD_LOG.printf("[main] unhandled frame '%s'\n", type);
   }

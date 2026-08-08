@@ -1,5 +1,5 @@
 {
-  "rev": 12,
+  "rev": 13,
   "themes": [
     {
       "name": "Midnight",
@@ -402,6 +402,11 @@
       "id": "stats",
       "title": "System",
       "type": "stats"
+    },
+    {
+      "id": "calendar",
+      "title": "Calendar",
+      "type": "calendar"
     }
   ]
 }
