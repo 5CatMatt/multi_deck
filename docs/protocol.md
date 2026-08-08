@@ -127,7 +127,7 @@ correct while you remember, and this exists for the times you forgot.
 | `layout` | `rev`, `data` | Full layout push. Device writes it to SD and rebuilds the UI |
 | `hid_exec` | `action` | Host asks the device to perform a device-local action — used to sequence mixed macros (see below) |
 | `toast` | `msg`, `lvl` | Transient on-screen message |
-| `backlight` | `v` | Brightness 0–100. Only 0 vs non-zero has any effect on the board as wired — see [hardware-notes.md](hardware-notes.md) |
+| `backlight` | `v` | Brightness 0–100, literal on a board rewired for PWM. Unmodified, only 0 vs non-zero has any effect — see [hardware-notes.md](hardware-notes.md) |
 | `time` | `epoch`, `tz_min` | Wall clock. Sent on connect and every 60s |
 | `power` | `state` | `"sleep"` or `"wake"` |
 

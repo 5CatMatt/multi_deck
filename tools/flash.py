@@ -193,7 +193,21 @@ def monitor(seconds: float) -> None:
     port = uart_port()
     print(f"--- {port} ---")
     deadline = time.time() + seconds
-    with serial.Serial(port, 115200, timeout=0.3) as s:
+
+    # DTR/RTS held low across the open, because on this board RTS drives EN and DTR drives IO0.
+    # pyserial asserts both by default, so a plain open() resets the board — which is invisible
+    # here, where a reset has just happened anyway, and ruins `--monitor` on a running deck: it
+    # zeroes lv_display_get_inactive_time() and device_time, i.e. exactly the state anyone
+    # attaching a monitor to diagnose idle or clock behaviour is trying to observe.
+    s = serial.Serial()
+    s.port = port
+    s.baudrate = 115200
+    s.timeout = 0.3
+    s.dtr = False
+    s.rts = False
+    s.open()
+
+    with s:
         while time.time() < deadline:
             chunk = s.read(4096)
             if chunk:

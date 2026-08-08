@@ -605,11 +605,24 @@ and listen, but the expected failure is ripple, not singing.
 rather than as a dead panel. Zero is honoured exactly, and is the one case that drops duty to a
 true 0% so EN falls below threshold and the converter shuts down rather than idling at minimum.
 
-**So do not write code that assumes brightness is binary.** The UI carries two knobs that
-multiply: the real backlight, always called with a real percentage, and a full-screen
-translucent black overlay that supplies darkness below the backlight's floor. The overlay is
-what makes the sleep clock readable at night and stays useful after the rewire; the backlight
-call is what starts working the day the wire moves. Neither is a workaround for the other.
+**So do not write code that assumes brightness is binary.** Keeping every layer percentage-based
+is what made the mod a one-line change above `board_port.cpp`, and it held: nothing in the idle
+machine, the themes or the protocol needed touching when the numbers became real.
+
+The UI carried two knobs that multiply — the backlight, and a full-screen translucent black
+overlay supplying darkness below the backlight's floor. **After the rewire the overlay has no
+dimming left to do** (`dim_opa` defaults to 0 with the mod, 55 without) and survives only as a
+touch shield: it swallows the tap that wakes the screen from Off, or dismisses the sleep clock,
+so a tap you cannot aim does not fire a macro you cannot see.
+
+Those two jobs were fused, and separating them was not optional. The overlay's *existence* used
+to be gated on the veil being non-zero, so setting `dim_opa` to 0 removed the touch shield as a
+side effect and the wake tap started firing tiles. If the veil is ever retired completely, keep
+the shield.
+
+It also only absorbs where the screen is unreadable. At the Dimmed stage the tiles are still
+legible, so a tap there fires and the brightness comes back with it — being made to tap twice on
+a screen you can read reads as the device being slow or broken.
 
 ## ✅ Benign boot warning: GT911 "Unable to initialize the I2C address"
 

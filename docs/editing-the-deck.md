@@ -326,18 +326,23 @@ question you answer by looking rather than by inferring from the panel.
 - **A disabled tile no longer fades the whole button.** It keeps its fill and moves the label to
   `text_muted`, so make sure `text_muted` is legible on `tile` — otherwise closing the agent makes
   half the deck unreadable rather than merely dimmed.
-- **`brightness` does nothing yet, and that is deliberate.** The backlight on this board is a
-  bare on/off line on the CH422G expander with no PWM in the path, so every non-zero value is
-  identical. It is still sent to the backlight honestly, and becomes literal the day that wire
-  moves to a GPIO — see [hardware-notes.md](hardware-notes.md).
+- **`brightness` and `dim_pct` are real percentages** on a board whose backlight has been rewired
+  for PWM, and the panel tracks them linearly from 4% up. On an unmodified board every non-zero
+  value is identical, because the backlight is a bare on/off line on the CH422G expander with no
+  PWM in the path — see [hardware-notes.md](hardware-notes.md) for the mod.
 
-  It briefly darkened the screen in software to make itself visible. That was a mistake and was
+  It once darkened the screen in software to make itself visible. That was a mistake and was
   reverted: brightness had never had an effect, so making it live meant every existing theme
   went 20% darker on flashing, and on a near-black theme the panel just read as off. **A dead
   setting coming alive should not change how a deck already looks.**
 - **`dim_opa` is the idle veil**, and belongs to the theme rather than to settings because a
   pale theme needs a heavier veil than a dark one to read as equally dimmed. It applies only
   after `idle_dim_s`, never at rest. Wake the screen before judging a colour change.
+
+  **Its default depends on the backlight: 0 with the PWM mod, 55 without.** The two multiply, so
+  a real 15% backlight behind a 55% veil lands near 7% of full and reads as a dead panel. On a
+  rewired board the veil has no dimming left to do, and the overlay stays only to swallow the
+  touch that wakes the screen from Off.
 - **Judge a colour against a neutral background.** A grey patch surrounded by blue reads as
   yellow-olive — ordinary simultaneous contrast, and a good way to chase a bug that is not there.
   The Colours page exists for this; switch to Paper before trusting what you see on a dark theme.
