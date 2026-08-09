@@ -422,8 +422,18 @@
           "action": {
             "type": "seq",
             "steps": [
-              { "type": "launch", "target": "mspaint.exe" },
-              { "type": "ahk", "fn": "PasteInto", "args": ["ahk_exe mspaint.exe", "^+x"] }
+              {
+                "type": "launch",
+                "target": "mspaint.exe"
+              },
+              {
+                "type": "ahk",
+                "fn": "PasteInto",
+                "args": [
+                  "ahk_exe mspaint.exe",
+                  "^+x"
+                ]
+              }
             ]
           },
           "hold": null
