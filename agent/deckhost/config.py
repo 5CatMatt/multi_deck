@@ -22,6 +22,10 @@ AGENT_TYPES = frozenset({"launch", "ahk", "shell"})
 # `theme` targets that never name a theme.
 THEME_KEYWORDS = frozenset({"", "next", "prev"})
 
+# What the device appends to a button id when reporting a long press it could not run itself.
+# Set in firmware/multi_deck/ui_builder.cpp; the two have to agree or holds go nowhere.
+HOLD_SUFFIX = ".hold"
+
 # Theme fields the firmware parses as colours, and the form it accepts: an optional '#' then
 # exactly six hex digits. Anything else is ignored and the built-in default kept — silently, on
 # the device, where you cannot see it. Catching it here is the difference between a typo you
@@ -90,6 +94,85 @@ ICON_NAMES = frozenset(
     """.split()
 )
 
+# ---------------------------------------------------------------------------
+# What each action type needs to do anything
+# ---------------------------------------------------------------------------
+#
+# None of this was checked until the editor learned to write actions. By hand you copy a working
+# button and change the target; from a form you can produce `{"type": "launch"}` with two clicks
+# and no target at all, and every one of these failures is silent from where you are standing —
+# the agent logs "launch action has no target" to a file nobody opens, the device logs a rejected
+# chord to a UART nothing is attached to, and the tile just does nothing when pressed.
+#
+# The list mirrors the guards already in actions.py and the parse switch in
+# firmware/multi_deck/deck_config.cpp::parseActionJson. Only the field that makes an action
+# meaningful is required; `args` and `cwd` are genuinely optional.
+ACTION_REQUIRED = {
+    "launch": "target",
+    "shell": "cmd",
+    "ahk": "fn",
+    "hid": "keys",
+    "hid_text": "text",
+    "media": "key",
+    "page": "target",
+    "seq": "steps",
+    "delay": "ms",
+    # `theme` is deliberately absent: an empty target means "next", which is a real thing to
+    # write. THEME_KEYWORDS covers it.
+}
+
+ACTION_TYPES = frozenset(DEVICE_LOCAL_TYPES | AGENT_TYPES | {"delay", "seq"})
+
+# Media keys, mirroring the strcmp chain in firmware/multi_deck/hid.cpp::sendMedia. An unknown
+# one logs and does nothing.
+MEDIA_KEYS = frozenset(
+    {"play_pause", "next", "prev", "stop", "mute", "vol_up", "vol_down"}
+)
+
+# Key tokens, mirroring kNamedKeys and kNamedModifiers in firmware/multi_deck/hid.cpp. Matching
+# there is case-insensitive (the token is upper-cased first), so these are stored upper-case and
+# compared upper-case.
+HID_MODIFIERS = frozenset(
+    {"CTRL", "CONTROL", "SHIFT", "ALT", "GUI", "WIN", "CMD", "ALTGR"}
+)
+
+HID_KEY_NAMES = frozenset(
+    """
+    ENTER RETURN ESC ESCAPE BACKSPACE TAB SPACE MINUS EQUAL LBRACKET RBRACKET BACKSLASH
+    SEMICOLON QUOTE GRAVE COMMA PERIOD SLASH CAPSLOCK
+    F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12
+    PRINTSCREEN SCROLLLOCK PAUSE INSERT HOME PAGEUP DELETE END PAGEDOWN RIGHT LEFT DOWN UP MENU
+    NUMLOCK KP_SLASH KP_ASTERISK KP_MINUS KP_PLUS KP_ENTER
+    KP_1 KP_2 KP_3 KP_4 KP_5 KP_6 KP_7 KP_8 KP_9 KP_0 KP_DOT
+    """.split()
+)
+
+# A USB keyboard report carries six non-modifier keys. The firmware rejects the whole chord past
+# that rather than truncating it, so the seventh key does not cost you one key — it costs you the
+# keypress.
+HID_MAX_KEYS = 6
+
+
+def resolve_hid_token(token: str) -> str | None:
+    """Mirrors resolveToken() in hid.cpp. Returns "modifier", "key", or None.
+
+    The single-character branch is the part worth reproducing exactly: letters and digits map
+    arithmetically onto the usage page rather than appearing in any table, and an upper-case
+    letter implies SHIFT — so `["A"]` is Shift+A and `["a"]` is a, which is not obvious from
+    looking at deck.json and is the kind of thing an editor should be able to explain.
+    """
+    if not isinstance(token, str) or not token:
+        return None
+
+    upper = token.upper()
+    if upper in HID_MODIFIERS:
+        return "modifier"
+    if upper in HID_KEY_NAMES:
+        return "key"
+    if len(token) == 1 and (token.isascii() and (token.isalpha() or token.isdigit())):
+        return "key"
+    return None
+
 
 class ConfigError(Exception):
     pass
@@ -133,6 +216,26 @@ def check_display(value: Any, subject: str, problems: list[str]) -> None:
 def default_deck_path() -> Path:
     """Repo-relative default: agent/deckhost/config.py -> <repo>/sdcard/deck.json."""
     return Path(__file__).resolve().parents[2] / "sdcard" / "deck.json"
+
+
+# Function definitions in lib.ahk: a name at column zero followed by a parameter list. AHK v2
+# has no other way to declare one, so this needs no more than it looks like it needs.
+AHK_DEF_RE = re.compile(r"^([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+
+
+def ahk_functions() -> set[str] | None:
+    """The helpers agent/ahk/lib.ahk defines, or None if there is no lib.ahk to read.
+
+    None is a third answer, not an empty set: the theme builder ships as an exe with no checkout
+    beside it, and "this deck references no AHK functions at all" is a very different statement
+    from "I cannot see the file". Only the first is worth putting on screen.
+    """
+    lib = Path(__file__).resolve().parents[1] / "ahk" / "lib.ahk"
+    try:
+        text = lib.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return set(AHK_DEF_RE.findall(text))
 
 
 @dataclass
@@ -233,11 +336,13 @@ class DeckConfig:
         """
         problems: list[str] = []
 
-        page_ids = {p.get("id") for p in self.raw.get("pages", [])}
+        pages = self.raw.get("pages") or []
+        page_ids = {p.get("id") for p in pages}
         theme_names = set(self.theme_names())
         seen: set[str] = set()
+        seen_pages: set[str] = set()
 
-        for page in self.raw.get("pages", []):
+        for index, page in enumerate(pages):
             page_type = page.get("type", "grid")
             if page_type not in PAGE_TYPES:
                 problems.append(
@@ -245,7 +350,19 @@ class DeckConfig:
                     f"{', '.join(sorted(PAGE_TYPES))}"
                 )
 
-            for button in page.get("buttons", []):
+            # Button ids have always been checked for uniqueness; page ids never were, and they
+            # are looked up the same way — the firmware takes the first match, so a duplicate
+            # makes every nav button pointing at that id go to whichever page comes first, and
+            # the other page becomes unreachable without anything saying so.
+            page_id = page.get("id")
+            if not page_id:
+                problems.append(f"pages[{index}] has no id, so nothing can navigate to it")
+            elif page_id in seen_pages:
+                problems.append(f"duplicate page id {page_id!r}")
+            else:
+                seen_pages.add(page_id)
+
+            for button in page.get("buttons") or []:
                 button_id = button.get("id")
 
                 if not button_id:
@@ -262,6 +379,15 @@ class DeckConfig:
                 self._validate_action(
                     action, button_id, page_ids, theme_names, problems
                 )
+
+                # A long press is an entirely separate action, parsed by the same code
+                # (deck_config.cpp:296) and never validated here until now. It is also the
+                # least visible thing on the deck — nothing about a tile says it has one — so
+                # a broken hold can sit in a layout indefinitely.
+                if button.get("hold") is not None:
+                    self._validate_action(
+                        button["hold"], f"{button_id} (hold)", page_ids, theme_names, problems
+                    )
 
         settings = self.raw.get("settings") or {}
         # An empty baseline is legal but pointless: the chain has nowhere left to fall through
@@ -399,10 +525,30 @@ class DeckConfig:
         theme_names: set[str],
         problems: list[str],
     ) -> None:
+        if not isinstance(action, dict):
+            problems.append(f"{button_id}: action is {action!r}, expected an object")
+            return
+
         kind = action.get("type")
 
         if kind is None:
             problems.append(f"{button_id}: action has no type")
+            return
+
+        if kind not in ACTION_TYPES:
+            problems.append(
+                f"{button_id}: action type is {kind!r}, expected one of "
+                f"{', '.join(sorted(ACTION_TYPES))}"
+            )
+            return
+
+        required = ACTION_REQUIRED.get(kind)
+        if required is not None and not action.get(required):
+            # `not` rather than `is None` on purpose: "", [] and 0 are all as useless here as an
+            # absent key, and all three are what an editor produces from an untouched field.
+            problems.append(
+                f"{button_id}: {kind} action has no {required}, so pressing it does nothing"
+            )
             return
 
         if kind == "page" and action.get("target") not in page_ids:
@@ -419,15 +565,130 @@ class DeckConfig:
                     f"(have: {', '.join(sorted(theme_names)) or 'none'})"
                 )
 
+        if kind == "media" and action.get("key") not in MEDIA_KEYS:
+            problems.append(
+                f"{button_id}: media key {action.get('key')!r} is not one of "
+                f"{', '.join(sorted(MEDIA_KEYS))}"
+            )
+
+        if kind == "hid":
+            self._validate_chord(action, button_id, problems)
+
+        if kind == "delay":
+            ms = action.get("ms")
+            if isinstance(ms, bool) or not isinstance(ms, int) or ms < 0:
+                problems.append(f"{button_id}: delay ms is {ms!r}, expected a whole number")
+
         if kind == "seq":
-            for step in action.get("steps", []):
+            for step in action.get("steps") or []:
                 self._validate_action(
                     step, button_id, page_ids, theme_names, problems
                 )
+
+    def _validate_chord(
+        self, action: dict[str, Any], button_id: str, problems: list[str]
+    ) -> None:
+        """Rejects a key chord the device would reject.
+
+        sendCombo() refuses the whole chord on the first token it cannot resolve, and again past
+        six non-modifier keys. Both write a line to UART0 and then do nothing, so from the deck
+        the failure is a tile that no longer types anything.
+        """
+        keys = action.get("keys")
+        if not isinstance(keys, list):
+            problems.append(f"{button_id}: hid keys is {keys!r}, expected a list of tokens")
+            return
+
+        pressed = 0
+        for token in keys:
+            resolved = resolve_hid_token(token)
+            if resolved is None:
+                problems.append(
+                    f"{button_id}: key token {token!r} is not one the device knows, "
+                    "so the whole chord is rejected. Modifiers: "
+                    f"{', '.join(sorted(HID_MODIFIERS))}; or a single letter or digit"
+                )
+                return
+            if resolved == "key":
+                pressed += 1
+
+        if pressed > HID_MAX_KEYS:
+            problems.append(
+                f"{button_id}: {pressed} non-modifier keys, and a USB report carries "
+                f"{HID_MAX_KEYS} — the device rejects the whole chord"
+            )
+        elif pressed == 0:
+            problems.append(
+                f"{button_id}: modifiers only ({', '.join(keys)}), so nothing is typed"
+            )
+
+    def actions(self):
+        """Yields (subject, action) for every action in the layout, holds and seq steps included.
+
+        One walk, so a check added later cannot quietly miss the places `_validate_action`
+        already reaches — which is exactly how `hold` went unvalidated for as long as it did.
+        """
+
+        def walk(action: Any, subject: str):
+            if not isinstance(action, dict):
+                return
+            yield subject, action
+            for step in action.get("steps") or []:
+                yield from walk(step, subject)
+
+        for page in self.raw.get("pages") or []:
+            for button in page.get("buttons") or []:
+                where = button.get("id") or f"page {page.get('id')!r}"
+                yield from walk(button.get("action"), where)
+                yield from walk(button.get("hold"), f"{where} (hold)")
+
+    def warnings(self) -> list[str]:
+        """Things worth saying that must not stop a load.
+
+        The distinction matters because `problems()` is what makes the agent refuse to start.
+        `ahk.fn` names a function in agent/ahk/lib.ahk, which is a file you are meant to edit —
+        an unrecognised name is as likely to be a helper you have not written yet as a typo, and
+        refusing to boot the agent over the first would be wrong. So it warns, and the editor
+        shows it next to the problems rather than instead of them.
+        """
+        known = ahk_functions()
+        if known is None:
+            return []  # no checkout to compare against; the packaged editor is one of these
+
+        found: list[str] = []
+        for subject, action in self.actions():
+            if action.get("type") != "ahk":
+                continue
+            fn = action.get("fn")
+            if fn and fn not in known and fn not in found:
+                found.append(
+                    f"{subject}: ahk function {fn!r} is not in agent/ahk/lib.ahk "
+                    f"(have: {', '.join(sorted(known)) or 'none'})"
+                )
+        return found
 
     def button(self, button_id: str) -> dict[str, Any] | None:
         return self.buttons.get(button_id)
 
     def action_for(self, button_id: str) -> dict[str, Any] | None:
+        """The action a press frame names, including the long-press form.
+
+        A long press the device cannot run itself arrives as `<id>.hold`
+        (firmware/multi_deck/ui_builder.cpp:374), and there is no button with that id — the
+        index is keyed by the ids written in deck.json. So every agent-side hold answered with
+        "Unknown button" and a toast, which reads as a corrupt layout rather than a missing six
+        lines here. A device-local hold worked fine, which is what kept it hidden.
+
+        The exact id is tried first, so a button somebody genuinely named `foo.hold` still wins
+        over `foo`'s long press.
+        """
         button = self.button(button_id)
-        return button.get("action") if button else None
+        if button is not None:
+            return button.get("action")
+
+        if button_id.endswith(HOLD_SUFFIX):
+            base = self.button(button_id[: -len(HOLD_SUFFIX)])
+            if base is not None:
+                return base.get("hold")
+
+        return None

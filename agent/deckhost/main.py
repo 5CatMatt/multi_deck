@@ -522,6 +522,8 @@ class DeckHost:
 
         self.config = fresh
         log.info("reloaded %s (rev %d, %d buttons)", path, fresh.rev, len(fresh.buttons))
+        for warning in fresh.warnings():
+            log.warning("%s", warning)
 
         if self.session_up:
             await self._push_layout()
@@ -635,6 +637,8 @@ async def async_main(argv: list[str] | None = None) -> int:
         return 2
 
     log.info("loaded %s (rev %d, %d buttons)", config.path, config.rev, len(config.buttons))
+    for warning in config.warnings():
+        log.warning("%s", warning)
 
     if args.simulate:
         # Drive a few buttons that between them cover a device-local action, an agent

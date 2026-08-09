@@ -738,6 +738,263 @@ class IconNameTests(unittest.TestCase):
                 self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
 
 
+class HidTokenTests(unittest.TestCase):
+    """config.py's key tables and hid.cpp's must be the same tables, for ICON_NAMES' reasons.
+
+    The failure is worse here than for icons, though. An unknown icon name degrades to showing
+    the tile's text label; an unknown key token makes sendCombo() reject the *whole chord* and
+    return, so the tile types nothing at all. Both write a line to UART0, which in daily use is
+    not attached to anything.
+    """
+
+    def _source(self) -> str:
+        return (REPO / "firmware" / "multi_deck" / "hid.cpp").read_text(encoding="utf-8")
+
+    def _table(self, name: str) -> set[str]:
+        table = re.search(rf"{name}\[\]\s*=\s*\{{(.*?)\n\}};", self._source(), re.S)
+        self.assertIsNotNone(table, f"could not find {name} in hid.cpp")
+        return set(re.findall(r'\{"([A-Z0-9_]+)",', table.group(1)))
+
+    def test_key_names_agree(self):
+        from deckhost.config import HID_KEY_NAMES
+
+        firmware = self._table("kNamedKeys")
+        self.assertTrue(firmware, "parsed no key names out of hid.cpp")
+        self.assertEqual(firmware, set(HID_KEY_NAMES), "hid.cpp and HID_KEY_NAMES have drifted")
+
+    def test_modifiers_agree(self):
+        from deckhost.config import HID_MODIFIERS
+
+        firmware = self._table("kNamedModifiers")
+        self.assertTrue(firmware, "parsed no modifiers out of hid.cpp")
+        self.assertEqual(firmware, set(HID_MODIFIERS), "hid.cpp and HID_MODIFIERS have drifted")
+
+    def test_media_keys_agree(self):
+        from deckhost.config import MEDIA_KEYS
+
+        # sendMedia is a strcmp chain rather than a table, so the keys are read from the
+        # comparisons themselves.
+        body = re.search(r"\bsendMedia\(const String.*?\n\}", self._source(), re.S)
+        self.assertIsNotNone(body, "could not find sendMedia in hid.cpp")
+        firmware = set(re.findall(r'key == "([a-z_]+)"', body.group(0)))
+
+        self.assertTrue(firmware, "parsed no media keys out of hid.cpp")
+        self.assertEqual(firmware, set(MEDIA_KEYS), "hid.cpp and MEDIA_KEYS have drifted")
+
+    def test_the_report_limit_matches_the_firmware(self):
+        from deckhost.config import HID_MAX_KEYS
+
+        self.assertRegex(self._source(), rf"key_count < {HID_MAX_KEYS}\b")
+
+    def test_single_characters_resolve_arithmetically(self):
+        """The branch with no table behind it, and the one an editor has to explain.
+
+        An upper-case letter implies SHIFT on the device, so ["A"] and ["a"] are different
+        keystrokes — which is not visible from reading deck.json.
+        """
+        from deckhost.config import resolve_hid_token
+
+        for token in ("a", "z", "A", "Z", "0", "9"):
+            with self.subTest(token=token):
+                self.assertEqual(resolve_hid_token(token), "key")
+
+        self.assertIsNone(resolve_hid_token("ab"))
+        self.assertIsNone(resolve_hid_token("é"))
+        self.assertIsNone(resolve_hid_token(""))
+        self.assertIsNone(resolve_hid_token(None))
+
+    def test_matching_is_case_insensitive_like_the_firmware(self):
+        from deckhost.config import resolve_hid_token
+
+        self.assertEqual(resolve_hid_token("ctrl"), "modifier")
+        self.assertEqual(resolve_hid_token("Ctrl"), "modifier")
+        self.assertEqual(resolve_hid_token("PAGEUP"), "key")
+        self.assertEqual(resolve_hid_token("pageup"), "key")
+
+
+class ActionValidationTests(unittest.TestCase):
+    """Every action field the firmware or the agent reads, checked before it ships.
+
+    None of this was checked while buttons were written by hand: you copied a working one and
+    changed the target. From a form, `{"type": "launch"}` with no target is two clicks — and
+    every failure here is silent from where you are standing, so the validator has to come
+    before the UI that makes them easy.
+    """
+
+    def _config(self, action, **button):
+        return DeckConfig.from_raw(
+            {
+                "rev": 1,
+                "themes": [{"name": "T"}],
+                "settings": {},
+                "pages": [
+                    {"id": "home", "buttons": [{"id": "b", "action": action, **button}]}
+                ],
+            },
+            validate=False,
+        )
+
+    def _problems(self, action, **button) -> str:
+        return " | ".join(self._config(action, **button).problems())
+
+    def test_an_action_missing_its_only_useful_field_is_caught(self):
+        for action, field_name in (
+            ({"type": "launch"}, "target"),
+            ({"type": "shell"}, "cmd"),
+            ({"type": "ahk"}, "fn"),
+            ({"type": "hid"}, "keys"),
+            ({"type": "hid_text"}, "text"),
+            ({"type": "media"}, "key"),
+            ({"type": "seq"}, "steps"),
+        ):
+            with self.subTest(type=action["type"]):
+                self.assertIn(f"no {field_name}", self._problems(action))
+
+    def test_an_empty_string_is_as_useless_as_an_absent_key(self):
+        """Which is what an untouched form field produces."""
+        self.assertIn("no target", self._problems({"type": "launch", "target": ""}))
+
+    def test_a_theme_action_may_have_no_target(self):
+        """Empty means "next", and that is a real thing to write."""
+        self.assertEqual(self._problems({"type": "theme", "target": ""}), "")
+
+    def test_an_unknown_action_type_is_named(self):
+        self.assertIn("action type is 'lanch'", self._problems({"type": "lanch", "target": "x"}))
+
+    def test_a_rejected_chord_is_caught_before_it_silently_types_nothing(self):
+        self.assertIn(
+            "not one the device knows",
+            self._problems({"type": "hid", "keys": ["ctrl", "shfit", "c"]}),
+        )
+        self.assertEqual(self._problems({"type": "hid", "keys": ["ctrl", "SHIFT", "c"]}), "")
+
+    def test_seven_keys_is_a_rejected_chord_not_a_truncated_one(self):
+        keys = ["a", "b", "c", "d", "e", "f", "g"]
+        self.assertIn("rejects the whole chord", self._problems({"type": "hid", "keys": keys}))
+        self.assertEqual(self._problems({"type": "hid", "keys": keys[:6]}), "")
+
+    def test_modifiers_alone_type_nothing(self):
+        self.assertIn(
+            "nothing is typed", self._problems({"type": "hid", "keys": ["ctrl", "shift"]})
+        )
+
+    def test_an_unknown_media_key_is_named(self):
+        self.assertIn(
+            "media key 'volume_up'", self._problems({"type": "media", "key": "volume_up"})
+        )
+
+    def test_a_delay_needs_a_number(self):
+        self.assertIn("delay ms is '250'", self._problems({"type": "delay", "ms": "250"}))
+        self.assertEqual(self._problems({"type": "delay", "ms": 250}), "")
+
+    def test_nested_steps_are_checked_too(self):
+        action = {"type": "seq", "steps": [{"type": "delay", "ms": 50}, {"type": "shell"}]}
+        self.assertIn("no cmd", self._problems(action))
+
+    def test_a_hold_is_validated_like_an_action(self):
+        """The least visible thing on a deck: nothing about a tile says it has a long press."""
+        problems = self._problems(
+            {"type": "launch", "target": "notepad.exe"},
+            hold={"type": "page", "target": "nowhere"},
+        )
+        self.assertIn("b (hold)", problems)
+        self.assertIn("unknown page", problems)
+
+    def test_duplicate_page_ids_are_caught(self):
+        raw = {
+            "rev": 1,
+            "themes": [{"name": "T"}],
+            "pages": [{"id": "home", "buttons": []}, {"id": "home", "buttons": []}],
+        }
+        problems = DeckConfig.from_raw(raw, validate=False).problems()
+        self.assertIn("duplicate page id 'home'", " | ".join(problems))
+
+    def test_a_page_with_no_id_cannot_be_navigated_to(self):
+        raw = {"rev": 1, "themes": [{"name": "T"}], "pages": [{"buttons": []}]}
+        problems = DeckConfig.from_raw(raw, validate=False).problems()
+        self.assertIn("has no id", " | ".join(problems))
+
+    def test_the_shipped_layout_passes_all_of_it(self):
+        """The point of adding checks is to find real mistakes, not to invent them."""
+        self.assertEqual(DeckConfig.load(REPO / "sdcard" / "deck.json").problems(), [])
+
+    def test_an_unknown_ahk_function_warns_rather_than_refusing_to_start(self):
+        """lib.ahk is a file you are meant to edit, so an unknown name may be one not yet written."""
+        config = self._config({"type": "ahk", "fn": "NotAHelper"})
+        self.assertEqual(config.problems(), [])
+        self.assertIn("NotAHelper", " | ".join(config.warnings()))
+
+    def test_the_shipped_ahk_functions_all_exist(self):
+        self.assertEqual(DeckConfig.load(REPO / "sdcard" / "deck.json").warnings(), [])
+
+
+class HoldDispatchTests(unittest.TestCase):
+    """A long press the device cannot run itself arrives under a different id than it left.
+
+    ui_builder.cpp sends `<id>.hold`, and the agent's index is keyed by the ids in deck.json —
+    so every agent-side hold answered "Unknown button" and toasted it. A device-local hold ran
+    fine, which is what kept this hidden: the ten-key's holds work, and those are the ones you
+    press while testing.
+    """
+
+    def _config(self):
+        return DeckConfig.from_raw(
+            {
+                "rev": 1,
+                "themes": [{"name": "T"}],
+                "pages": [
+                    {
+                        "id": "home",
+                        "buttons": [
+                            {
+                                "id": "edit.paste",
+                                "action": {"type": "hid", "keys": ["ctrl", "v"]},
+                                "hold": {"type": "ahk", "fn": "PasteInto", "args": ["x"]},
+                            }
+                        ],
+                    }
+                ],
+            },
+            validate=False,
+        )
+
+    def test_the_suffix_matches_the_firmware(self):
+        from deckhost.config import HOLD_SUFFIX
+
+        source = (REPO / "firmware" / "multi_deck" / "ui_builder.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f'button.id + "{HOLD_SUFFIX}"', source)
+
+    def test_a_hold_press_resolves_to_the_hold_action(self):
+        config = self._config()
+        self.assertEqual(config.action_for("edit.paste.hold"), config.buttons["edit.paste"]["hold"])
+
+    def test_a_plain_press_still_resolves_to_the_plain_action(self):
+        self.assertEqual(self._config().action_for("edit.paste")["type"], "hid")
+
+    def test_an_exact_id_wins_over_the_suffix_rule(self):
+        """A button someone genuinely named `foo.hold` must not be shadowed."""
+        raw = {
+            "rev": 1,
+            "themes": [{"name": "T"}],
+            "pages": [
+                {
+                    "id": "home",
+                    "buttons": [
+                        {"id": "foo", "hold": {"type": "shell", "cmd": "wrong"}},
+                        {"id": "foo.hold", "action": {"type": "shell", "cmd": "right"}},
+                    ],
+                }
+            ],
+        }
+        config = DeckConfig.from_raw(raw, validate=False)
+        self.assertEqual(config.action_for("foo.hold")["cmd"], "right")
+
+    def test_an_unknown_hold_is_still_unknown(self):
+        self.assertIsNone(self._config().action_for("nosuch.hold"))
+
+
 class ConfigShapeTests(unittest.TestCase):
     """deck.json is a socket: objects of the same kind present the same keys.
 
@@ -952,7 +1209,9 @@ class IconValidationTests(unittest.TestCase):
         self.assertIn(fragment, str(caught.exception))
 
     def test_known_symbol_accepted(self):
-        self._load({"id": "b", "icon": "play", "action": {"type": "media", "key": "play"}})
+        # The icon is `play`; the media key is `play_pause`. They are not the same vocabulary,
+        # which is easy to forget and is now caught.
+        self._load({"id": "b", "icon": "play", "action": {"type": "media", "key": "play_pause"}})
 
     def test_sd_path_accepted_without_touching_the_card(self):
         self._load(
