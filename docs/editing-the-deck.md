@@ -21,6 +21,48 @@ big for the link, so they only reach the card by hand — see [Wallpapers](#wall
 `sdcard/assets.ver` is a generated hash of everything else in `sdcard/`; leave it alone and let
 `tools/make_assets.py` write it. It is how the deck knows to tell you the card needs rewriting.
 
+## Editing colours with the theme builder
+
+Colours are the part of this file worth having a window for. Every theme token fails the same
+quiet way — a colour the firmware cannot parse leaves the built-in default in place, which looks
+exactly like the edit never arrived — and the only way to see what a value actually does is to
+put it on the panel and look.
+
+```
+python tools/theme_builder.py
+```
+
+It edits `themes` and `settings` only, and shows an 800×480 preview of your real pages rendered
+from the same rules the firmware uses: gradients, per-tile opacity, corner radii, borders, the
+`display` chain, and which tiles grey out when the agent is closed. Pages, buttons and actions
+are read for the preview but never rewritten, so nothing below `"pages"` in the file is touched.
+
+Three things it does that hand-editing does not:
+
+- **Writes `rev` for you.** Every save that changes something bumps it, which is what makes the
+  change survive a replug rather than only a tray reload — see [below](#the-other-way--bump-rev).
+- **Shows the layout's wire size** against the 8192-byte line limit, with the warning line at
+  80% where `tools/protocol_test.py` starts failing. Adding themes is the easiest way to walk
+  into that limit, and it is the one that fails silently.
+- **Keeps "unset" writable.** Every nullable field has a *Default* tick beside it, so `dim_opa`
+  and `flip180` can stay `null` and keep deferring to `config.h` rather than being pinned to
+  whatever the slider happened to read.
+
+It never opens the serial port, so it does not fight the running agent and works with the deck
+unplugged. Saving is still only half the job: reload from the tray afterwards, exactly as if you
+had edited the file by hand.
+
+To build it as a standalone `.exe`:
+
+```
+pip install pyinstaller
+pyinstaller agent/deckbuilder/deckbuilder.spec --noconfirm \
+    --distpath dist/deckbuilder --workpath dist/pyi-work
+```
+
+Fonts and icons in the preview are substitutes — the deck's are compiled into the firmware and
+do not exist on the PC — and the window says so under the canvas. Everything else is exact.
+
 ## Getting a change onto the deck
 
 ### The quick way — tray reload

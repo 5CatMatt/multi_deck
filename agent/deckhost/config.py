@@ -154,9 +154,30 @@ class DeckConfig:
         except json.JSONDecodeError as exc:
             raise ConfigError(f"{path} is not valid JSON: {exc}") from exc
 
+        return cls.from_raw(raw, path=path)
+
+    @classmethod
+    def from_raw(
+        cls, raw: dict[str, Any], path: Path | None = None, *, validate: bool = True
+    ) -> DeckConfig:
+        """Indexes a layout that is already in memory, and by default validates it too.
+
+        The half of load() after the file read, split out because the theme builder holds a
+        candidate layout it has not written yet and needs to know whether it is legal on every
+        keystroke. Writing it to a temp file to find out would work and would be silly.
+
+        `validate=False` still indexes, and leaves you to call `problems()` yourself. That is
+        what an editor wants: it needs the list on every keystroke, and half the entries are
+        transient — a colour is invalid for as long as it takes to type the third hex digit,
+        which is not an occasion to raise.
+
+        `path` is still worth passing when there is one: it is what `asset_root` reads to
+        resolve a wallpaper, so a candidate loaded without it cannot say where its images live.
+        """
         config = cls(rev=int(raw.get("rev", 0)), raw=raw, path=path)
         config._index()
-        config.validate()
+        if validate:
+            config.validate()
         return config
 
     @property
@@ -197,6 +218,19 @@ class DeckConfig:
 
     def validate(self) -> None:
         """Catches the layout mistakes that would otherwise surface as a dead tile."""
+        problems = self.problems()
+        if problems:
+            raise ConfigError("deck.json problems:\n  " + "\n  ".join(problems))
+
+    def problems(self) -> list[str]:
+        """The same checks as validate(), returned rather than raised.
+
+        The agent wants an exception — a layout it cannot trust should stop the load. An editor
+        wants the list, because it is showing you the problems *while* you create them and half
+        of them are transient: a colour is invalid for as long as it takes to type the third
+        hex digit. Reassembling that list by splitting the exception message would work right
+        up until a problem string contained a newline.
+        """
         problems: list[str] = []
 
         page_ids = {p.get("id") for p in self.raw.get("pages", [])}
@@ -245,8 +279,7 @@ class DeckConfig:
 
         self._validate_themes(problems)
 
-        if problems:
-            raise ConfigError("deck.json problems:\n  " + "\n  ".join(problems))
+        return problems
 
     # Seconds-valued settings, and the smallest value that is not simply "off". ArduinoJson's
     # `| default` yields the default for a wrong *type*, so a string here reads as an edit that

@@ -15,3 +15,10 @@ build/
 *.bin.hex
 build/
 build-pwm/
+
+# PyInstaller output for the theme builder. Deliberately under dist/ and not build/, which is
+# already the Arduino toolchain's — sharing that name means one --clean takes out the other.
+dist/
+
+# Drawn at build time from deckhost/tray.py so the two icons cannot drift apart.
+agent/deckbuilder/deckbuilder.ico

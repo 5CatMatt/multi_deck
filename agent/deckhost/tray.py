@@ -25,6 +25,41 @@ COLOR_WAITING = (0x6E, 0x76, 0x81, 255)
 
 REFRESH_S = 2.0
 
+# The size the proportions were drawn for. Everything below scales from it, so the same shape
+# can be asked for at 256px for an application icon without being redrawn by hand.
+BASE_SIZE = 64
+
+
+def make_image(connected: bool, size: int = BASE_SIZE):
+    """The deck mark: a rounded body with a 3x2 tile grid inside it.
+
+    Module-level rather than a method on TrayIcon because the theme builder's application icon
+    is the same drawing at a larger size, and two hand-drawn versions of one mark drift — you
+    notice the day they are side by side in the taskbar.
+    """
+    from PIL import Image, ImageDraw
+
+    accent = COLOR_CONNECTED if connected else COLOR_WAITING
+    k = size / BASE_SIZE
+
+    def s(value: float) -> float:
+        return value * k
+
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        [s(2), s(2), size - s(3), size - s(3)],
+        radius=s(10), fill=COLOR_BODY, outline=accent, width=max(1, round(s(3))),
+    )
+
+    # A little 3x2 tile grid, so the icon reads as "deck" at 16px.
+    for row in range(2):
+        for col in range(3):
+            x, y = s(13 + col * 14), s(18 + row * 17)
+            draw.rounded_rectangle([x, y, x + s(10), y + s(11)], radius=s(2), fill=accent)
+
+    return image
+
 
 class TrayIcon:
     def __init__(
@@ -47,25 +82,7 @@ class TrayIcon:
     # -- drawing -------------------------------------------------------------------------
 
     def _make_image(self, connected: bool):
-        from PIL import Image, ImageDraw
-
-        size = 64
-        accent = COLOR_CONNECTED if connected else COLOR_WAITING
-
-        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle(
-            [2, 2, size - 3, size - 3], radius=10, fill=COLOR_BODY, outline=accent, width=3
-        )
-
-        # A little 3x2 tile grid, so the icon reads as "deck" at 16px.
-        for row in range(2):
-            for col in range(3):
-                x = 13 + col * 14
-                y = 18 + row * 17
-                draw.rounded_rectangle([x, y, x + 10, y + 11], radius=2, fill=accent)
-
-        return image
+        return make_image(connected)
 
     def _status_text(self) -> str:
         return "Deck connected" if self._status_getter() else "Waiting for deck..."

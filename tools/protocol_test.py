@@ -1561,5 +1561,669 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(host.session_up)
 
 
+class ConfigReuseTests(unittest.TestCase):
+    """from_raw() and problems() exist so the editor validates without a temp file.
+
+    Both are refactors of load()/validate() rather than new rules, so what is worth testing is
+    that they still say exactly what the originals said — a second copy of the checks that
+    drifts is worse than no editor validation at all, because it would report problems the
+    agent does not have and miss the ones it does.
+    """
+
+    def _deck(self) -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8"))
+
+    def test_from_raw_matches_load(self):
+        from_disk = DeckConfig.load(REPO / "sdcard" / "deck.json")
+        in_memory = DeckConfig.from_raw(self._deck(), path=REPO / "sdcard" / "deck.json")
+
+        self.assertEqual(in_memory.rev, from_disk.rev)
+        self.assertEqual(set(in_memory.buttons), set(from_disk.buttons))
+        self.assertEqual(in_memory.asset_root, from_disk.asset_root)
+
+    def test_problems_is_empty_exactly_when_validate_passes(self):
+        config = DeckConfig.from_raw(self._deck(), validate=False)
+        self.assertEqual(config.problems(), [])
+        config.validate()  # must not raise
+
+    def test_problems_lists_what_validate_would_have_raised(self):
+        broken = self._deck()
+        broken["themes"][0]["accent"] = "nonsense"
+        broken["pages"][0]["buttons"][0]["icon"] = "not_a_symbol"
+
+        config = DeckConfig.from_raw(broken, validate=False)
+        problems = config.problems()
+        self.assertEqual(len(problems), 2)
+
+        with self.assertRaises(ConfigError) as caught:
+            config.validate()
+        for problem in problems:
+            self.assertIn(problem, str(caught.exception))
+
+    def test_validate_still_raises_by_default(self):
+        broken = self._deck()
+        broken["themes"][0]["radius"] = "16"  # a string where the firmware wants an int
+        with self.assertRaises(ConfigError):
+            DeckConfig.from_raw(broken)
+
+
+class Mdi1Tests(unittest.TestCase):
+    """The container now has an inverse, which is the only reason it can be checked at all.
+
+    encode() alone could only ever be tested against hand-written expectations. With decode()
+    the format has to agree with itself, and the round trip catches a whole class of stride and
+    byte-order mistakes that a fixed test vector walks straight past.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+
+    def test_round_trip_survives_rgb565_quantisation(self):
+        from PIL import Image
+
+        from deckhost import mdi1
+
+        source = Image.new("RGB", (5, 3))
+        for x in range(5):
+            for y in range(3):
+                source.putpixel((x, y), (x * 50, y * 80, 255 - x * 40))
+
+        width, height, pixels = mdi1.decode(mdi1.encode(source))
+        self.assertEqual((width, height), (5, 3))
+
+        decoded = Image.frombytes("RGB", (width, height), pixels)
+        for x in range(5):
+            for y in range(3):
+                for got, want in zip(decoded.getpixel((x, y)), source.getpixel((x, y))):
+                    # 5 bits of red and blue, 6 of green: the error is bounded, not zero.
+                    self.assertLessEqual(abs(got - want), 8)
+
+    def test_encoding_a_decoded_image_is_stable(self):
+        """Quantisation happens once. A file re-saved through the tools must not drift."""
+        from PIL import Image
+
+        from deckhost import mdi1
+
+        source = Image.new("RGB", (4, 4), (137, 91, 200))
+        once = mdi1.encode(source)
+        width, height, pixels = mdi1.decode(once)
+        twice = mdi1.encode(Image.frombytes("RGB", (width, height), pixels))
+        self.assertEqual(once, twice)
+
+    def test_extremes_are_exact(self):
+        from PIL import Image
+
+        from deckhost import mdi1
+
+        image = Image.new("RGB", (2, 1))
+        image.putpixel((0, 0), (0, 0, 0))
+        image.putpixel((1, 0), (255, 255, 255))
+        _w, _h, pixels = mdi1.decode(mdi1.encode(image))
+        self.assertEqual(tuple(pixels), (0, 0, 0, 255, 255, 255))
+
+    def test_the_shipped_wallpapers_decode(self):
+        from deckhost import mdi1
+
+        walls = sorted((REPO / "sdcard" / "wall").glob("*.bin"))
+        self.assertTrue(walls, "no wallpapers to check")
+        for wall in walls:
+            with self.subTest(wall=wall.name):
+                width, height, pixels = mdi1.decode(wall.read_bytes())
+                self.assertEqual((width, height), (800, 480))
+                self.assertEqual(len(pixels), 800 * 480 * 3)
+
+    def test_the_three_header_checks_are_the_firmware_s(self):
+        from deckhost import mdi1
+
+        with self.assertRaises(mdi1.Mdi1Error):
+            mdi1.decode(b"MDI")  # too short for a header
+        with self.assertRaises(mdi1.Mdi1Error):
+            mdi1.decode(b"PNG\x00" + bytes(8))  # wrong magic
+        with self.assertRaises(mdi1.Mdi1Error):
+            mdi1.decode(b"MDI1" + bytes([4, 0, 4, 0]) + bytes(10))  # short body
+
+    def test_make_assets_still_exports_the_format(self):
+        """tools/make_assets.py re-exports these, and AssetFormatTests calls them by that name."""
+        sys.path.insert(0, str(REPO / "tools"))
+        import make_assets
+
+        from deckhost import mdi1
+
+        self.assertIs(make_assets.encode, mdi1.encode)
+        self.assertIs(make_assets.rgb_to_rgb565, mdi1.rgb_to_rgb565)
+        self.assertEqual(make_assets.MAGIC, mdi1.MAGIC)
+
+
+class ImagePipelineTests(unittest.TestCase):
+    """The wallpaper pipeline has two callers, and only one of them has a Python to run.
+
+    tools/make_assets.py drives it from a command line; the theme builder calls it in-process.
+    The builder used to shell out to the script instead, which worked from a checkout and could
+    not possibly work from the packaged exe — sys.executable there is the builder itself, and
+    app.py is not a file on disk at all once PyInstaller has folded it into the archive. The
+    failure was a button that reported "not next to this build" on the one install where the
+    button was the only way to convert anything.
+
+    So the pipeline moved into the package and the script imports it. These tests hold that
+    shape: one implementation, and no assumption that an interpreter is lying around.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        sys.path.insert(0, str(REPO / "tools"))
+
+    def test_make_assets_delegates_rather_than_reimplementing(self):
+        import make_assets
+
+        from deckhost import images
+
+        for name in ("cover_crop", "dim", "blur", "SCREEN_W", "SCREEN_H", "DEFAULT_ICON_BG"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(make_assets, name), getattr(images, name))
+
+    def test_the_builder_never_needs_an_interpreter(self):
+        """A frozen app has no Python to shell out to, so it must not try.
+
+        Checked against the source rather than by running it, because the failure only appears
+        in the packaged build and the test suite does not produce one. Parsed rather than
+        grepped: the module docstring names make_assets.py on purpose, to say where the shared
+        pipeline is driven from, and a text search cannot tell prose from a call.
+        """
+        import ast
+
+        tree = ast.parse((REPO / "agent" / "deckbuilder" / "app.py").read_text(encoding="utf-8"))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotEqual(
+                        alias.name.split(".")[0], "subprocess",
+                        "app.py imports subprocess — the exe has no interpreter to spawn",
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                self.assertNotEqual(
+                    (node.module or "").split(".")[0], "subprocess",
+                    "app.py imports subprocess — the exe has no interpreter to spawn",
+                )
+            elif isinstance(node, ast.Attribute):
+                self.assertFalse(
+                    node.attr == "executable"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "sys",
+                    "app.py reads sys.executable, which in a frozen build is the builder itself",
+                )
+
+    def test_wallpaper_fills_the_panel_from_any_aspect_ratio(self):
+        import tempfile
+
+        from PIL import Image
+
+        from deckhost import images, mdi1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for size in ((600, 1000), (2000, 400), (800, 480)):
+                with self.subTest(size=size):
+                    src = Path(tmp) / f"{size[0]}x{size[1]}.png"
+                    Image.new("RGB", size, (10, 120, 200)).save(src)
+                    dst = Path(tmp) / f"{size[0]}.bin"
+
+                    self.assertEqual(images.wallpaper(src, dst), (800, 480))
+                    width, height, _pixels = mdi1.decode(dst.read_bytes())
+                    self.assertEqual((width, height), (800, 480))
+
+    def test_wallpaper_creates_the_folder_it_writes_into(self):
+        """The builder points this at sdcard/wall/, which need not exist on a fresh card tree."""
+        import tempfile
+
+        from PIL import Image
+
+        from deckhost import images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.png"
+            Image.new("RGB", (100, 100), (1, 2, 3)).save(src)
+            dst = Path(tmp) / "wall" / "new.bin"
+            images.wallpaper(src, dst)
+            self.assertTrue(dst.is_file())
+
+    def test_converting_restamps_so_the_card_check_stays_honest(self):
+        """make_assets restamps on every run; the builder has to do the same by hand."""
+        import tempfile
+
+        from PIL import Image
+
+        from deckhost import images
+        from deckhost.assets import asset_stamp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "deck.json").write_text("{}", encoding="utf-8")
+            before = asset_stamp(root)
+
+            src = root / "src.png"
+            Image.new("RGB", (60, 60), (9, 9, 9)).save(src)
+            images.wallpaper(src, root / "wall" / "x.bin")
+            src.unlink()  # the source is not part of the card
+
+            self.assertNotEqual(asset_stamp(root), before)
+            write_stamp(root)
+            self.assertEqual(read_stamp(root), asset_stamp(root))
+
+    def test_a_filename_from_a_photo_becomes_addressable(self):
+        from deckbuilder.app import _safe_stem
+
+        self.assertEqual(_safe_stem("Holiday 2024 (1)"), "holiday-2024-1")
+        self.assertEqual(_safe_stem("DSC_0042"), "dsc_0042")
+        self.assertEqual(_safe_stem("...."), "wallpaper")
+
+
+class DeckWriterTests(unittest.TestCase):
+    """The theme builder rewrites deck.json, so it has to leave the rest of it alone.
+
+    A full json.dump would be correct and unreadable: it reflows the hand-written `seq` steps
+    under `pages` into twenty lines of diff for a one-colour change, and a tool whose diffs you
+    cannot read is one you stop trusting with the master copy. So the writer splices, and these
+    tests are the argument that the splice is safe — starting with the one that matters, which
+    is that rewriting an unchanged file changes nothing at all.
+    """
+
+    def _text(self) -> str:
+        # Bytes, not read_text(): this file has CRLF endings and universal newline translation
+        # would hand the writer something that does not match the disk.
+        return (REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8")
+
+    def _doc(self):
+        from deckbuilder.model import ThemeDoc
+
+        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+
+    def _tail(self, text: str) -> str:
+        from deckbuilder import writer
+
+        return text[text.find(writer.ANCHOR.format(key="pages")):]
+
+    def test_rewriting_an_unchanged_file_is_byte_identical(self):
+        from deckbuilder import writer
+
+        original = self._text()
+        data = json.loads(original)
+        result, spliced = writer.build(original, data["themes"], data["settings"], data["rev"])
+
+        self.assertTrue(spliced, "fell back to a full re-dump on the shipped file")
+        self.assertEqual(result, original)
+
+    def test_changing_a_colour_leaves_pages_untouched(self):
+        from deckbuilder import writer
+
+        original = self._text()
+        data = json.loads(original)
+        themes = json.loads(json.dumps(data["themes"]))
+        themes[0]["accent"] = "#ff0000"
+
+        result, spliced = writer.build(original, themes, data["settings"], data["rev"] + 1)
+        self.assertTrue(spliced)
+        self.assertEqual(self._tail(result), self._tail(original))
+        self.assertEqual(json.loads(result)["themes"][0]["accent"], "#ff0000")
+
+    def test_the_diff_is_only_the_lines_that_changed(self):
+        """The whole reason the splice exists, stated as a number."""
+        from deckbuilder import writer
+
+        original = self._text()
+        data = json.loads(original)
+        themes = json.loads(json.dumps(data["themes"]))
+        themes[0]["accent"] = "#ff0000"
+
+        result, _ = writer.build(original, themes, data["settings"], data["rev"] + 1)
+        changed = [
+            (a, b)
+            for a, b in zip(original.splitlines(), result.splitlines())
+            if a != b
+        ]
+        self.assertEqual(len(changed), 2, changed)  # rev and the colour, nothing else
+
+    def test_crlf_survives_a_save(self):
+        from deckbuilder import writer
+
+        original = self._text()
+        self.assertEqual(writer.newline_style(original), "\r\n", "fixture is no longer CRLF")
+
+        data = json.loads(original)
+        result, _ = writer.build(original, data["themes"], data["settings"], 99)
+        self.assertEqual(writer.newline_style(result), "\r\n")
+        # Every LF belongs to a CRLF — no line was left half-converted.
+        self.assertNotIn("\n", result.replace("\r\n", ""))
+
+    def test_lf_files_stay_lf(self):
+        from deckbuilder import writer
+
+        original = self._text().replace("\r\n", "\n")
+        data = json.loads(original)
+        result, spliced = writer.build(original, data["themes"], data["settings"], data["rev"])
+        self.assertTrue(spliced)
+        self.assertEqual(result, original)
+
+    def test_a_reformatted_file_falls_back_rather_than_guessing(self):
+        from deckbuilder import writer
+
+        original = json.dumps(json.loads(self._text()), indent=4) + "\n"
+        data = json.loads(original)
+        result, spliced = writer.build(original, data["themes"], data["settings"], 42)
+
+        self.assertFalse(spliced, "spliced a file it had no right to recognise")
+        self.assertEqual(json.loads(result)["rev"], 42)
+        self.assertEqual(json.loads(result)["pages"], data["pages"])
+
+    def test_the_written_file_still_loads(self):
+        import tempfile
+
+        from deckbuilder import writer
+
+        doc = self._doc()
+        doc.new_theme("Scratch")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deck.json"
+            path.write_bytes(self._text().encode("utf-8"))
+            writer.write(path, doc.themes, doc.settings, doc.next_rev())
+
+            reloaded = DeckConfig.load(path)  # validates, and raises if it cannot
+            self.assertEqual(reloaded.rev, doc.next_rev())
+            self.assertEqual(len(reloaded.raw["themes"]), len(doc.themes))
+
+    def test_writing_leaves_nothing_behind_in_the_folder(self):
+        """Anything left under sdcard/ would change the card's asset stamp for good."""
+        import tempfile
+
+        from deckbuilder import writer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            path = folder / "deck.json"
+            path.write_bytes(self._text().encode("utf-8"))
+
+            doc = self._doc()
+            writer.write(path, doc.themes, doc.settings, 77, backup_dir=folder / "elsewhere")
+
+            self.assertEqual(
+                sorted(p.name for p in folder.iterdir()), ["deck.json", "elsewhere"]
+            )
+
+    def test_a_stale_temp_file_is_swept(self):
+        import tempfile
+
+        from deckbuilder import writer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / ".deck.json.999.tmp").write_text("left by a crash", encoding="utf-8")
+            writer.sweep_temp_files(folder)
+            self.assertEqual(list(folder.iterdir()), [])
+
+
+class ThemeShapeTests(unittest.TestCase):
+    """Themes the editor builds must be the same shape as the ones already in the file.
+
+    ConfigShapeTests enforces this on what is committed. These enforce it on what the editor
+    would produce, which is the only way the two can be guaranteed to keep agreeing once themes
+    stop being written by hand.
+    """
+
+    def _doc(self):
+        from deckbuilder.model import ThemeDoc
+
+        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+
+    def _reference(self) -> tuple:
+        deck = json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8"))
+        return tuple(deck["themes"][0])
+
+    def test_the_hardcoded_field_order_matches_the_shipped_file(self):
+        """The literal is only a fallback for an empty file, and it must not drift."""
+        from deckbuilder.model import THEME_FIELD_ORDER
+
+        self.assertEqual(THEME_FIELD_ORDER, self._reference())
+
+    def test_the_template_covers_every_field(self):
+        from deckbuilder.model import THEME_FIELD_ORDER, THEME_TEMPLATE
+
+        self.assertEqual(set(THEME_TEMPLATE), set(THEME_FIELD_ORDER))
+
+    def test_a_new_theme_keeps_the_canonical_order(self):
+        doc = self._doc()
+        doc.new_theme("Fresh")
+        self.assertEqual(tuple(doc.themes[-1]), self._reference())
+
+    def test_a_duplicated_theme_keeps_the_canonical_order(self):
+        doc = self._doc()
+        doc.duplicate(0)
+        self.assertEqual(tuple(doc.themes[1]), self._reference())
+
+    def test_a_new_theme_writes_its_defaults_down(self):
+        """"Unset" is a value in this format, not an absent key."""
+        doc = self._doc()
+        doc.new_theme("Fresh")
+        theme = doc.themes[-1]
+
+        self.assertIsNone(theme["dim_opa"], "dim_opa must defer to config.h")
+        self.assertIsNone(theme["flip180"], "flip180 must defer to config.h")
+        self.assertEqual(theme["display"], "")
+        self.assertEqual(theme["wallpaper"], "")
+
+    def test_a_new_theme_gets_a_name_that_is_not_taken(self):
+        doc = self._doc()
+        doc.new_theme("Midnight")
+        self.assertNotEqual(doc.themes[-1]["name"], "Midnight")
+
+    def test_the_writer_refuses_a_drifted_theme(self):
+        from deckbuilder import writer
+
+        doc = self._doc()
+        del doc.themes[0]["idle"]
+        with self.assertRaises(writer.WriteError):
+            writer.splice(
+                (REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"),
+                json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8")),
+                doc.themes, doc.settings, 1,
+            )
+
+    def test_renaming_follows_the_references(self):
+        """A theme is referenced by name, and a stale name fails silently on the device."""
+        doc = self._doc()
+        doc.settings["theme"] = doc.themes[1]["name"]
+        doc.rename(1, "Renamed")
+
+        self.assertEqual(doc.settings["theme"], "Renamed")
+        self.assertEqual(doc.problems(), [])
+
+    def test_renaming_follows_theme_actions_including_nested_ones(self):
+        doc = self._doc()
+        page = doc.raw["pages"][0]
+        page["buttons"][0]["action"] = {
+            "type": "seq",
+            "steps": [{"type": "theme", "target": doc.themes[0]["name"]}],
+        }
+        doc.rename(0, "Elsewhere")
+        self.assertEqual(page["buttons"][0]["action"]["steps"][0]["target"], "Elsewhere")
+
+    def test_rev_bumps_only_when_something_changed(self):
+        doc = self._doc()
+        self.assertFalse(doc.dirty)
+        self.assertEqual(doc.next_rev(), doc.rev)
+
+        doc.themes[0]["accent"] = "#123456"
+        self.assertTrue(doc.dirty)
+        self.assertEqual(doc.next_rev(), doc.rev + 1)
+
+    def test_the_last_theme_cannot_be_deleted(self):
+        from deckbuilder.model import ModelError
+
+        doc = self._doc()
+        while len(doc.themes) > 1:
+            doc.delete(0)
+        with self.assertRaises(ModelError):
+            doc.delete(0)
+
+
+class ByteBudgetTests(unittest.TestCase):
+    """The meter has to measure the thing that actually fails, not an approximation of it."""
+
+    def _raw(self) -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8"))
+
+    def test_the_budget_is_the_wire_size(self):
+        from deckbuilder import budget
+
+        raw = self._raw()
+        self.assertEqual(
+            budget.frame_bytes(raw["rev"], raw),
+            len(protocol.encode(protocol.layout(raw["rev"], raw))),
+        )
+
+    def test_the_warning_line_is_where_the_test_suite_fails(self):
+        """If these drift, the meter goes green right up until the build breaks."""
+        from deckbuilder import budget
+
+        self.assertEqual(budget.WARN_FRACTION, 0.8)
+        self.assertEqual(budget.LIMIT, protocol.MAX_LINE_BYTES)
+
+    def test_adding_a_theme_is_predicted_before_it_lands(self):
+        from deckbuilder import budget
+
+        raw = self._raw()
+        before = budget.frame_bytes(raw["rev"], raw)
+        predicted = before + budget.theme_cost(raw["themes"][0])
+
+        raw["themes"].append(json.loads(json.dumps(raw["themes"][0])))
+        actual = budget.frame_bytes(raw["rev"], raw)
+
+        self.assertEqual(predicted, actual)
+
+    def test_headroom_agrees_with_actually_adding_themes(self):
+        from deckbuilder import budget
+
+        raw = self._raw()
+        template = raw["themes"][0]
+        to_warning, _to_limit = budget.headroom_in_themes(raw["rev"], raw, template)
+
+        for _ in range(to_warning):
+            raw["themes"].append(json.loads(json.dumps(template)))
+        self.assertFalse(budget.report(raw["rev"], raw).over_warning)
+
+        raw["themes"].append(json.loads(json.dumps(template)))
+        self.assertTrue(budget.report(raw["rev"], raw).over_warning)
+
+    def test_the_shipped_layout_is_not_already_warning(self):
+        from deckbuilder import budget
+
+        raw = self._raw()
+        self.assertEqual(budget.report(raw["rev"], raw).level, "near")
+
+
+class BuilderIconTests(unittest.TestCase):
+    """Every icon the firmware can draw needs a stand-in, for the same reason ICON_NAMES does.
+
+    A name with no entry would render as a blank tile in the preview, which reads as a layout
+    bug you do not have — the preview inventing problems is worse than it admitting the glyph
+    is an approximation.
+    """
+
+    def test_every_firmware_icon_has_a_preview_glyph(self):
+        from deckbuilder.icons import PREVIEW_GLYPHS
+
+        self.assertEqual(set(PREVIEW_GLYPHS), set(ICON_NAMES))
+
+    def test_glyphs_are_single_characters(self):
+        from deckbuilder.icons import PREVIEW_GLYPHS
+
+        for name, glyph in PREVIEW_GLYPHS.items():
+            with self.subTest(icon=name):
+                self.assertEqual(len(glyph), 1)
+
+    def test_unknown_names_get_no_glyph_rather_than_a_wrong_one(self):
+        from deckbuilder import icons
+
+        self.assertIsNone(icons.glyph_for("not_a_symbol"))
+
+
+class PreviewRenderTests(unittest.TestCase):
+    """The preview is the only feedback loop there is, so it has to survive every theme."""
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+
+    def _doc(self):
+        from deckbuilder.model import ThemeDoc
+
+        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+
+    def test_every_shipped_theme_and_page_renders(self):
+        from deckbuilder import render
+
+        doc = self._doc()
+        for theme in doc.themes:
+            for page in doc.raw["pages"]:
+                with self.subTest(theme=theme["name"], page=page["id"]):
+                    preview = render.render_page(
+                        doc.candidate_raw(), theme, page["id"],
+                        asset_root=REPO / "sdcard",
+                    )
+                    self.assertEqual(preview.image.size, (render.SCREEN_W, render.SCREEN_H))
+                    self.assertEqual(preview.warnings, [])
+
+    def test_every_tile_state_renders(self):
+        from deckbuilder import render
+
+        doc = self._doc()
+        for state in ("normal", "pressed", "disabled"):
+            with self.subTest(state=state):
+                preview = render.render_page(
+                    doc.candidate_raw(), doc.themes[0], "launch",
+                    asset_root=REPO / "sdcard", state=state,
+                )
+                self.assertEqual(preview.image.size, (render.SCREEN_W, render.SCREEN_H))
+
+    def test_a_missing_wallpaper_degrades_to_the_background(self):
+        """The device paints `bg` and toasts the reason; the preview must not simply crash."""
+        from deckbuilder import render
+
+        doc = self._doc()
+        theme = dict(doc.themes[0], wallpaper="/wall/does-not-exist.bin", tile_opa=0)
+        preview = render.render_page(
+            doc.candidate_raw(), theme, "launch", asset_root=REPO / "sdcard"
+        )
+
+        self.assertTrue(preview.warnings)
+        self.assertEqual(preview.image.getpixel((400, 300)), render.parse_color("#0d1117", 0))
+
+    def test_geometry_matches_the_firmware(self):
+        """The numbers the firmware computes with C integer division, computed the same way."""
+        from deckbuilder import render
+
+        # (800 - 8*5)//4 = 190, and (424 - 8*4)//3 = 130 — not 130.67. The 10px left over is a
+        # real gap at the bottom of the panel, and rounding it away here would make the preview
+        # wrong in the dimension people actually notice.
+        self.assertEqual(render._cells(4, 3), (190, 130))
+        # The ten-key: (424 - 8*6)//5 = 75.
+        self.assertEqual(render._cells(4, 5), (190, 75))
+
+    def test_the_caption_names_the_substitutions(self):
+        from deckbuilder import render
+
+        doc = self._doc()
+        preview = render.render_page(
+            doc.candidate_raw(), doc.themes[0], "launch", asset_root=REPO / "sdcard"
+        )
+        self.assertIn("Montserrat", preview.font_name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

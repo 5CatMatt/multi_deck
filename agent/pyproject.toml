@@ -27,6 +27,10 @@ all = ["pynvml>=11.5", "ahk>=1.0"]
 
 [project.scripts]
 deckhost = "deckhost.main:main"
+deckbuilder = "deckbuilder.app:main"
 
 [tool.setuptools]
-packages = ["deckhost"]
+# deckbuilder is the theme editor. It ships alongside the agent because it is built on
+# deckhost's config, protocol and asset modules and imports them as a package — but it adds no
+# dependencies of its own: tkinter is stdlib and Pillow is already needed for the tray.
+packages = ["deckhost", "deckbuilder"]

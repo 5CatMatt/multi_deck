@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import struct
 import sys
 from pathlib import Path
 
@@ -42,132 +41,47 @@ REPO = Path(__file__).resolve().parents[1]
 # The stamp is computed by the agent package rather than reimplemented here. Two copies of a
 # hash drift, and a drifted hash reports mismatches that are not real — which is worse than no
 # check at all, because you stop believing it.
+#
+# The container format is imported for the same reason, and it took a third copy appearing
+# before that was obvious: the magic was written out here, again in make_icons.py, and read a
+# third time by firmware/multi_deck/assets.cpp. The firmware one has to be its own; these two
+# did not. They are re-exported below so `make_assets.encode` still means what it always did.
 sys.path.insert(0, str(REPO / "agent"))
 from deckhost.assets import STAMP_FILE, write_stamp  # noqa: E402
-
-MAGIC = b"MDI1"
-SCREEN_W = 800
-SCREEN_H = 480
+from deckhost.images import (  # noqa: E402,F401
+    DEFAULT_ICON_BG,
+    SCREEN_H,
+    SCREEN_W,
+    blur,
+    cover_crop,
+    dim,
+)
+from deckhost import images  # noqa: E402
+from deckhost.mdi1 import MAGIC, encode, rgb_to_rgb565  # noqa: E402,F401
 
 # What gets copied to the card, and so what the stamp describes.
 SDCARD_ROOT = REPO / "sdcard"
 
-DEFAULT_ICON_BG = "1b2129"
-
 
 def _require_pillow():
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image, ImageOps  # noqa: F401
     except ImportError:
         sys.exit("Pillow is required: pip install pillow")
-    return Image, ImageOps
-
-
-def rgb_to_rgb565(r: int, g: int, b: int) -> int:
-    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-
-
-def encode(image) -> bytes:
-    """Packs an RGB image into the MDI1 container.
-
-    Works off tobytes() rather than getdata(): getdata() is deprecated in Pillow 13, and
-    per-pixel struct.pack over 384,000 pixels is slow enough to notice.
-    """
-    width, height = image.size
-    raw = image.tobytes()  # three bytes per pixel, row-major
-
-    pixels = bytearray(width * height * 2)
-    for src in range(0, len(raw), 3):
-        value = rgb_to_rgb565(raw[src], raw[src + 1], raw[src + 2])
-        dst = (src // 3) * 2
-        pixels[dst] = value & 0xFF  # little-endian, matching the ESP32's uint16 reads
-        pixels[dst + 1] = value >> 8
-
-    return bytes(MAGIC) + struct.pack("<HH", width, height) + bytes(pixels)
-
-
-def cover_crop(image, target_w: int, target_h: int, anchor: str):
-    """Scales to cover the target, then crops the overflow.
-
-    Cover rather than fit: letterbox bars read as a rendering fault. `anchor` picks which part
-    of the overflowing axis is kept, so a portrait photo with its subject near the top is not
-    cropped through the middle.
-    """
-    from PIL import Image
-
-    src_w, src_h = image.size
-    scale = max(target_w / src_w, target_h / src_h)
-    scaled = image.resize(
-        (max(target_w, round(src_w * scale)), max(target_h, round(src_h * scale))),
-        Image.LANCZOS,
-    )
-
-    scaled_w, scaled_h = scaled.size
-    overflow_x = scaled_w - target_w
-    overflow_y = scaled_h - target_h
-
-    if anchor == "top":
-        left, top = overflow_x // 2, 0
-    elif anchor == "bottom":
-        left, top = overflow_x // 2, overflow_y
-    else:
-        left, top = overflow_x // 2, overflow_y // 2
-
-    return scaled.crop((left, top, left + target_w, top + target_h))
-
-
-def dim(image, percent: int):
-    """Darkens by `percent`. Multiplicative, so highlights keep their shape."""
-    if percent <= 0:
-        return image
-    from PIL import Image
-
-    factor = max(0.0, 1.0 - percent / 100.0)
-    return Image.eval(image, lambda v: int(v * factor))
-
-
-def blur(image, radius: float):
-    if radius <= 0:
-        return image
-    from PIL import ImageFilter
-
-    return image.filter(ImageFilter.GaussianBlur(radius))
 
 
 def convert_wallpaper(src: Path, dst: Path, args) -> tuple[int, int]:
-    Image, ImageOps = _require_pillow()
-
-    image = Image.open(src)
-    # Phone photos carry rotation in EXIF rather than in the pixels; without this a portrait
-    # shot arrives on its side.
-    image = ImageOps.exif_transpose(image).convert("RGB")
-
-    image = cover_crop(image, args.width, args.height, args.anchor)
-    image = blur(image, args.blur)
-    image = dim(image, args.dim)
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(encode(image))
-    return image.size
+    _require_pillow()
+    return images.wallpaper(
+        src, dst,
+        width=args.width, height=args.height, anchor=args.anchor,
+        blur_radius=args.blur, dim_percent=args.dim,
+    )
 
 
 def convert_icon(src: Path, dst: Path, args) -> tuple[int, int]:
-    Image, ImageOps = _require_pillow()
-
-    image = Image.open(src)
-    image = ImageOps.exif_transpose(image).convert("RGBA")
-    image = image.resize((args.size, args.size), Image.LANCZOS)
-
-    # The panel has no alpha, so transparency is flattened against the tile colour. Doing it
-    # here rather than on the device keeps edges from fringing against the background.
-    bg_hex = args.bg.lstrip("#")
-    background = tuple(int(bg_hex[i : i + 2], 16) for i in (0, 2, 4))
-    flat = Image.new("RGB", image.size, background)
-    flat.paste(image, mask=image.split()[3])
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(encode(flat))
-    return flat.size
+    _require_pillow()
+    return images.icon(src, dst, size=args.size, bg=args.bg)
 
 
 def _resolve_sources(patterns: list[str]) -> list[Path]:
