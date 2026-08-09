@@ -116,6 +116,29 @@ class Preview:
     warnings: list[str] = field(default_factory=list)
     font_name: str = ""
 
+    # What was drawn, so the canvas can turn a click back into a tile. Insertion-ordered by
+    # draw order, which is LVGL's z-order too (creation order), so hit-testing `reversed()`
+    # picks the tile that is visually on top of an overlap.
+    boxes: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+
+    # Where auto-flow actually put each tile: id -> (col, row, w, h). The editor needs this to
+    # write a pin that does not move anything, and it is not derivable from deck.json alone.
+    placed: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+
+    # Tiles the firmware would not build at all. Absent from `boxes`, because they are absent
+    # from the panel — listed here so the window can say so rather than leaving a hole.
+    skipped: list[str] = field(default_factory=list)
+
+    # (cols, rows) of the page drawn, or None if it was not a grid page.
+    cell: tuple[int, int] | None = None
+
+    def at(self, x: int, y: int) -> str | None:
+        """The id of the topmost tile under a point."""
+        for button_id, (x0, y0, x1, y1) in reversed(list(self.boxes.items())):
+            if x0 <= x < x1 and y0 <= y < y1:
+                return button_id
+        return None
+
 
 # -- colour ------------------------------------------------------------------------------
 
@@ -419,11 +442,12 @@ def clear_asset_cache() -> None:
 
 def _draw_grid_page(
     base: Image.Image, page: dict, theme: dict, settings: dict, *, link_up: bool,
-    state: str, asset_root: Path | None, warnings: list[str],
+    state: str, asset_root: Path | None, warnings: list[str], preview: Preview,
 ) -> None:
     cols, rows = grid_size(page.get("grid"))
     cell_w, cell_h = _cells(cols, rows)
     radius = radius_of(theme)
+    preview.cell = (cols, rows)
 
     flow = 0
     for index, button in enumerate(page.get("buttons") or []):
@@ -437,8 +461,12 @@ def _draw_grid_page(
             col, row = flow % cols, flow // cols
             flow += 1
 
+        button_id = button.get("id") or f"[{index}]"
+        preview.placed[button_id] = (col, row, max(1, w), max(1, h))
+
         if row >= rows:
             warnings.append(f"{button.get('id')}: falls outside the {cols}x{rows} grid")
+            preview.skipped.append(button_id)
             continue
         if col + w > cols:
             # The device logs nothing for this at all. The tile is created at its computed x and
@@ -460,6 +488,7 @@ def _draw_grid_page(
 
         fill_opa, border_opa, accent = _tile_state(theme, tile_state)
         box = _tile_box(col, row, w, h, cell_w, cell_h)
+        preview.boxes[button_id] = box
         draw_card(
             base, box, theme,
             fill_opa=fill_opa, radius=radius, border_opa=border_opa,
@@ -580,6 +609,7 @@ def render_page(
     settings = raw.get("settings") or {}
 
     base = Image.new("RGB", (SCREEN_W, SCREEN_H), token(theme, "bg"))
+    preview = Preview(image=base, warnings=warnings, font_name=face_description())
 
     wallpaper = theme.get("wallpaper") or ""
     if wallpaper:
@@ -592,7 +622,7 @@ def render_page(
     kind = page.get("type") or "grid"
     if kind == "grid":
         _draw_grid_page(base, page, theme, settings, link_up=link_up, state=state,
-                        asset_root=asset_root, warnings=warnings)
+                        asset_root=asset_root, warnings=warnings, preview=preview)
     elif kind == "numpad":
         _draw_numpad_page(base, theme)
     else:
@@ -600,4 +630,4 @@ def render_page(
 
     _draw_nav(base, raw, theme, page.get("id"), link_up, warnings)
 
-    return Preview(image=base, warnings=warnings, font_name=face_description())
+    return preview

@@ -26,6 +26,7 @@ from typing import Any
 from PIL import ImageTk
 
 from deckbuilder import budget, render, writer
+from deckbuilder.layout_panel import LayoutPanel
 from deckbuilder.model import DeckDoc, ModelError
 from deckbuilder.theme_form import (
     BASE_POINTS,
@@ -124,6 +125,8 @@ class BuilderApp:
         self._scroll_panes: list[tuple[tk.Canvas, int, ttk.Frame]] = []
         self._problem_signature: tuple = ()
         self._override = False
+        self._drag: dict[str, Any] | None = None
+        self.preview = render.Preview(image=None)  # replaced on the first draw
 
         writer.sweep_temp_files(path.parent)
 
@@ -313,11 +316,14 @@ class BuilderApp:
         notebook.pack(fill="both", expand=True)
 
         themes = ttk.Frame(notebook, padding=8)
+        layout = ttk.Frame(notebook, padding=8)
         settings = ttk.Frame(notebook, padding=8)
         notebook.add(themes, text="  Themes  ")
+        notebook.add(layout, text="  Layout  ")
         notebook.add(settings, text="  Settings  ")
 
         self._build_theme_tab(themes)
+        self.layout_panel = LayoutPanel(layout, self)
         self._build_settings_tab(settings)
 
     def _build_theme_tab(self, parent: ttk.Frame) -> None:
@@ -450,6 +456,14 @@ class BuilderApp:
                                 highlightthickness=0, background="#000000")
         self.canvas.pack()
 
+        # Selection and drag feedback are canvas items drawn over the Pillow image rather than
+        # baked into it. That keeps render.py a pure transcription of the firmware — it has no
+        # notion of "selected", because the deck has none — and means clicking a tile does not
+        # cost a re-render of an 800x480 composite.
+        self.canvas.bind("<Button-1>", self._canvas_press)
+        self.canvas.bind("<B1-Motion>", self._canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
+
         self.caption = ttk.Label(parent, foreground="#8b949e", justify="left")
         self.caption.pack(anchor="w", pady=(6, 0))
 
@@ -499,6 +513,23 @@ class BuilderApp:
 
     def _theme_choices(self) -> tuple[tuple[str, Any], ...]:
         return tuple((name, name) for name in self.doc.theme_names())
+
+    # -- what the layout panel needs from the window -------------------------------------
+
+    def library_dir(self) -> Path:
+        """Where a park/import dialog opens.
+
+        There is no fixed library home — that was decided deliberately, so a theme can live in
+        Dropbox or beside a project — which makes "wherever you were last" the only sensible
+        starting point. Falls back to the deck's own folder rather than to nothing.
+        """
+        return last_library() or self.doc.path.parent
+
+    def remember_library(self, folder: Path) -> None:
+        remember_library(folder)
+
+    def app_backups(self) -> Path:
+        return app_dir() / "backups"
 
     def _wallpaper_choices(self) -> tuple[tuple[str, Any], ...]:
         options: list[tuple[str, Any]] = [("None (flat background)", "")]
@@ -575,9 +606,12 @@ class BuilderApp:
         self._draw_meter()
         self._draw_problems()
         self._refresh_list()
+        self.layout_panel.refresh()
         self.page_box.configure(values=self._page_titles())
-        if not self.page_var.get():
-            titles = self._page_titles()
+        titles = self._page_titles()
+        if self.page_var.get() not in titles:
+            # A page can now be renamed, parked or deleted out from under the combobox, and a
+            # stale selection there renders pages[0] while claiming to be showing something else.
             self.page_var.set(titles[0] if titles else "")
 
     def _draw_preview(self) -> None:
@@ -599,10 +633,160 @@ class BuilderApp:
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
 
+        self.preview = preview
+        self._draw_selection()
+
         caption = preview.font_name
         if preview.warnings:
             caption += "\n" + "  •  ".join(preview.warnings)
         self.caption.configure(text=caption)
+
+    # -- the canvas as a layout tool -----------------------------------------------------
+
+    def _draw_selection(self) -> None:
+        """Outlines the selected tile, and ghosts anything the firmware would not draw."""
+        self.canvas.delete("overlay")
+        zoom = self.zoom.get()
+
+        for button_id in self.preview.skipped:
+            # Not in `boxes`, because it is not on the panel. Drawn at the edge as a hollow
+            # marker so a tile the deck silently drops is visible here rather than merely absent
+            # — "it disappeared" is the hardest version of this bug to diagnose.
+            self.canvas.create_text(
+                render.SCREEN_W * zoom - 8, render.SCREEN_H * zoom - 8,
+                text=f"off-grid: {button_id}", anchor="se", fill="#e5534b", tags="overlay",
+            )
+
+        selected = self._selected_button_id()
+        box = self.preview.boxes.get(selected) if selected else None
+        if box is None:
+            return
+
+        x0, y0, x1, y1 = (round(v * zoom) for v in box)
+        self.canvas.create_rectangle(
+            x0, y0, x1 - 1, y1 - 1, outline="#4aa3ff", width=2, tags="overlay"
+        )
+
+    def _selected_button_id(self) -> str | None:
+        picked = self.layout_panel.selection()
+        if picked is None or picked[0] != "button":
+            return None
+        _kind, page_index, index = picked
+        if self.doc.pages[page_index].get("id") != self._page_id():
+            return None
+        try:
+            return self.doc.pages[page_index]["buttons"][index].get("id")
+        except (IndexError, KeyError):
+            return None
+
+    def _at(self, event) -> tuple[int, int]:
+        """Canvas coordinates in the preview's own pixels, undoing the zoom."""
+        zoom = self.zoom.get() or 1.0
+        return round(self.canvas.canvasx(event.x) / zoom), round(
+            self.canvas.canvasy(event.y) / zoom
+        )
+
+    def _canvas_press(self, event) -> None:
+        x, y = self._at(event)
+        button_id = self.preview.at(x, y)
+        self._drag = None
+        if button_id is None:
+            return
+
+        located = self._locate(button_id)
+        if located is None:
+            return
+        page_index, index = located
+        self._drag = {"id": button_id, "page": page_index, "index": index, "from": (x, y)}
+        self.layout_panel.select_button(page_index, index)
+
+    def _canvas_drag(self, event) -> None:
+        if not self._drag:
+            return
+        x, y = self._at(event)
+        zoom = self.zoom.get()
+
+        self.canvas.delete("drag")
+        cols_rows = self.preview.cell
+        if cols_rows is None:
+            return
+
+        cell = render.cell_at(x, y, *cols_rows)
+        if cell is None:
+            return
+
+        cell_w, cell_h = render._cells(*cols_rows)
+        box = render._tile_box(cell[0], cell[1], 1, 1, cell_w, cell_h)
+        x0, y0, x1, y1 = (round(v * zoom) for v in box)
+        self.canvas.create_rectangle(
+            x0, y0, x1 - 1, y1 - 1, outline="#3fb950", width=2, dash=(4, 3), tags="drag"
+        )
+
+    def _canvas_release(self, event) -> None:
+        drag = self._drag
+        self._drag = None
+        self.canvas.delete("drag")
+        if not drag:
+            return
+
+        x, y = self._at(event)
+        if self.preview.cell is None:
+            return
+        cell = render.cell_at(x, y, *self.preview.cell)
+        if cell is None:
+            return  # a gutter, the nav bar, or the margin — no guessing at the nearer side
+
+        page_index, index = drag["page"], drag["index"]
+        if (x, y) == drag["from"]:
+            return  # a click, not a drag
+
+        if self.doc.is_pinned(page_index):
+            self._drop_pinned(page_index, index, cell)
+        else:
+            self._drop_auto(page_index, index, cell)
+
+    def _drop_pinned(self, page_index: int, index: int, cell: tuple[int, int]) -> None:
+        """Fixed page: the drop writes col/row, which is what Fixed is for."""
+        button = self.doc.pages[page_index]["buttons"][index]
+        if (button.get("pos") or {}).get("col") == cell[0] and \
+                (button.get("pos") or {}).get("row") == cell[1]:
+            return
+
+        self.doc.snapshot()
+        pos = dict(button.get("pos") or {"w": 1, "h": 1})
+        pos["col"], pos["row"] = cell
+        button["pos"] = {key: pos.get(key, 1) for key in ("col", "row", "w", "h")}
+        self._say(
+            f"Moved {button.get('id')} to column {cell[0]}, row {cell[1]}. "
+            "Overlaps are listed below rather than prevented — two tiles in one cell is legal "
+            "on the device, and the top one simply wins.",
+            "ok",
+        )
+        self.refresh(immediate=True)
+
+    def _drop_auto(self, page_index: int, index: int, cell: tuple[int, int]) -> None:
+        """Auto page: the drop reorders the array, which costs nothing on the wire."""
+        cols = (self.preview.cell or (4, 3))[0]
+        target = min(cell[1] * cols + cell[0], len(self.doc.pages[page_index]["buttons"]) - 1)
+        if target == index:
+            return
+
+        self.doc.snapshot()
+        new_index = self.doc.move_button(page_index, index, target - index)
+        self.layout_panel.select_button(page_index, new_index)
+        self._say(
+            "Reordered. On an Auto page the order in the file is the layout, so this costs "
+            "nothing — switch the page to Fixed if you want spans or deliberate gaps.",
+            "ok",
+        )
+        self.refresh(immediate=True)
+
+    def _locate(self, button_id: str) -> tuple[int, int] | None:
+        for page_index, page in enumerate(self.doc.pages):
+            for index, button in enumerate(page.get("buttons") or []):
+                if button.get("id") == button_id:
+                    return page_index, index
+        return None
 
     def _draw_meter(self) -> None:
         report = budget.report(self.doc.next_rev(), self.doc.candidate_raw())
@@ -860,12 +1044,34 @@ def _settings_file() -> Path:
     return app_dir() / "builder.json"
 
 
-def remember(path: Path) -> None:
+def _stored() -> dict:
+    try:
+        data = json.loads(_settings_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _store(**values) -> None:
     try:
         _settings_file().parent.mkdir(parents=True, exist_ok=True)
-        _settings_file().write_text(json.dumps({"deck": str(path)}), encoding="utf-8")
+        _settings_file().write_text(json.dumps({**_stored(), **values}), encoding="utf-8")
     except OSError:
         pass
+
+
+def remember(path: Path) -> None:
+    _store(deck=str(path))
+
+
+def remember_library(folder: Path) -> None:
+    """Kept separately from the deck path, and separately on purpose.
+
+    Library files live wherever you want them — that was the decision — so the folder you park
+    into has nothing to do with where deck.json is. Storing one key for both means the dialog
+    opens in the wrong place every other time you use it.
+    """
+    _store(library=str(folder))
 
 
 def last_used() -> Path | None:
@@ -874,11 +1080,13 @@ def last_used() -> Path | None:
     A packaged exe has no idea where the repo is, so the alternative to remembering is a file
     dialog on every launch.
     """
-    try:
-        stored = json.loads(_settings_file().read_text(encoding="utf-8")).get("deck")
-    except (OSError, ValueError):
-        return None
+    stored = _stored().get("deck")
     return Path(stored) if stored and Path(stored).exists() else None
+
+
+def last_library() -> Path | None:
+    stored = _stored().get("library")
+    return Path(stored) if stored and Path(stored).is_dir() else None
 
 
 def resolve(explicit: Path | None) -> Path | None:

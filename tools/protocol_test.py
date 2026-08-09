@@ -2777,6 +2777,128 @@ class AutoFlowTests(unittest.TestCase):
         self.assertGreater(seventh + geometry.TAB_W, geometry.SCREEN_W)
 
 
+class PreviewFeedbackTests(unittest.TestCase):
+    """The preview reports what it drew, so a click can be turned back into a tile."""
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+
+    def _deck(self) -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"))
+
+    def _render(self, deck: dict, page_id: str = "launch"):
+        from deckbuilder import render
+
+        return render.render_page(
+            deck, deck["themes"][0], page_id, asset_root=REPO / "sdcard"
+        )
+
+    def test_every_drawn_tile_is_reported_with_its_box(self):
+        deck = self._deck()
+        page = next(p for p in deck["pages"] if p["id"] == "launch")
+        preview = self._render(deck)
+
+        self.assertEqual(list(preview.boxes), [b["id"] for b in page["buttons"]])
+        self.assertEqual(preview.cell, (4, 3))
+
+    def test_a_hit_test_finds_the_tile_under_the_point(self):
+        deck = self._deck()
+        preview = self._render(deck)
+
+        for button_id, (x0, y0, x1, y1) in preview.boxes.items():
+            with self.subTest(button=button_id):
+                self.assertEqual(preview.at((x0 + x1) // 2, (y0 + y1) // 2), button_id)
+
+        self.assertIsNone(preview.at(2, 2), "the nav bar is not a tile")
+
+    def test_the_topmost_tile_wins_an_overlap(self):
+        """LVGL z-order is creation order, so the later tile is the one you would press."""
+        deck = self._deck()
+        page = next(p for p in deck["pages"] if p["id"] == "launch")
+
+        # The last cell of the 4x3 grid, which auto-flow does not reach: pinning these two frees
+        # their slots, so the ten remaining tiles fill (0,0) through (1,2) and stop.
+        page["buttons"][0]["pos"] = {"col": 3, "row": 2, "w": 1, "h": 1}
+        page["buttons"][1]["pos"] = {"col": 3, "row": 2, "w": 1, "h": 1}
+
+        preview = self._render(deck)
+        box = preview.boxes[page["buttons"][1]["id"]]
+        self.assertEqual(
+            preview.at((box[0] + box[2]) // 2, (box[1] + box[3]) // 2),
+            page["buttons"][1]["id"],
+        )
+
+    def test_placement_says_where_auto_flow_actually_put_things(self):
+        from deckbuilder import geometry
+
+        deck = self._deck()
+        page = next(p for p in deck["pages"] if p["id"] == "launch")
+        preview = self._render(deck)
+
+        self.assertEqual(
+            [(k, *v) for k, v in preview.placed.items()], geometry.auto_flow(page)
+        )
+
+    def test_a_tile_the_firmware_would_not_build_is_named_rather_than_missing(self):
+        deck = self._deck()
+        page = next(p for p in deck["pages"] if p["id"] == "launch")
+        page["buttons"][2]["pos"] = {"col": 0, "row": 9, "w": 1, "h": 1}
+
+        preview = self._render(deck)
+        self.assertEqual(preview.skipped, [page["buttons"][2]["id"]])
+        self.assertNotIn(page["buttons"][2]["id"], preview.boxes)
+
+    def test_a_page_that_is_not_a_grid_reports_no_cells(self):
+        preview = self._render(self._deck(), "numpad")
+        self.assertIsNone(preview.cell)
+        self.assertEqual(preview.boxes, {})
+
+
+class ButtonFormTests(unittest.TestCase):
+    """The action editor must never quietly drop a key it does not understand."""
+
+    def test_every_action_type_is_either_modelled_or_deliberately_not(self):
+        from deckbuilder.button_form import KNOWN_KEYS, SIMPLE_FIELDS
+        from deckhost.config import ACTION_TYPES
+
+        self.assertEqual(set(KNOWN_KEYS), set(ACTION_TYPES))
+        # seq is the one type with no simple row: its payload is a list of actions, and a
+        # nested list-of-forms would be most of the work of the whole panel.
+        self.assertEqual(set(ACTION_TYPES) - set(SIMPLE_FIELDS), {"seq"})
+
+    def test_the_required_field_is_the_one_the_row_edits(self):
+        """Otherwise the form can build an action the validator immediately rejects."""
+        from deckbuilder.button_form import SIMPLE_FIELDS
+        from deckhost.config import ACTION_REQUIRED
+
+        for kind, required in ACTION_REQUIRED.items():
+            if kind not in SIMPLE_FIELDS:
+                continue
+            with self.subTest(type=kind):
+                self.assertEqual(SIMPLE_FIELDS[kind][0], required)
+
+    def test_the_known_keys_cover_what_the_firmware_and_agent_read(self):
+        source = (REPO / "firmware" / "multi_deck" / "deck_config.cpp").read_text(
+            encoding="utf-8"
+        )
+        from deckbuilder.button_form import KNOWN_KEYS
+
+        # Scoped to parseActionJson: parseTheme reads `src["bg"]` and friends out of a different
+        # kind of object entirely, and the whole file would drag all seventeen theme tokens in.
+        body = re.search(r"void parseActionJson\(.*?\n\}", source, re.S)
+        self.assertIsNotNone(body, "could not find parseActionJson in deck_config.cpp")
+        parsed = set(re.findall(r'src\["(\w+)"\]', body.group(0)))
+        self.assertIn("keys", parsed, "the regex stopped matching what the firmware reads")
+        modelled = set().union(*KNOWN_KEYS.values())
+        self.assertTrue(
+            parsed <= modelled,
+            f"parseActionJson reads {sorted(parsed - modelled)}, which no form row models",
+        )
+
+
 class PageOperationTests(unittest.TestCase):
     """Pages and buttons are references as much as objects, so editing one edits the others."""
 
