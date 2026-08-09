@@ -23,11 +23,18 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from deckbuilder import geometry
 from deckhost.config import DeckConfig
+
+# Below this a tile is smaller than the pad of a finger, which is the point at which a grid stops
+# being a deck and starts being a test. Not a firmware limit — the device will happily draw a 8x6
+# grid of 90x60 tiles — which is exactly why it is worth saying out loud.
+MIN_TILE_PX = 60
 
 # Used only when the file being opened has no themes at all to copy a shape from — a new or
 # emptied deck.json. Kept in step with the shipped file by a test rather than by vigilance.
@@ -301,6 +308,225 @@ class DeckDoc:
         """
         return {key: theme.get(key, THEME_TEMPLATE.get(key)) for key in self.field_order}
 
+    # -- pages ---------------------------------------------------------------------------
+
+    @property
+    def boot_page(self) -> str | None:
+        """What the deck shows at power-on: pages[0], with nothing in the format naming it.
+
+        Which makes it the easiest thing to change by accident. Reordering pages to get the nav
+        tabs in a nicer order silently changes what you see when you plug the deck in, and there
+        is no setting anywhere to look at afterwards and work out why.
+        """
+        return self.pages[0].get("id") if self.pages else None
+
+    def page_index(self, page_id: str) -> int:
+        for index, page in enumerate(self.pages):
+            if page.get("id") == page_id:
+                return index
+        raise ModelError(f"no page {page_id!r}")
+
+    def shaped_page(self, page: dict[str, Any]) -> dict[str, Any]:
+        return {key: page.get(key, PAGE_TEMPLATE.get(key)) for key in self.page_order}
+
+    def shaped_button(self, button: dict[str, Any]) -> dict[str, Any]:
+        return {key: button.get(key, BUTTON_TEMPLATE.get(key)) for key in self.button_order}
+
+    def new_page(self, title: str = "New page", page_type: str = "grid") -> int:
+        page = self.shaped_page({
+            **copy.deepcopy(PAGE_TEMPLATE),
+            "id": self._unique_page_id(_slug(title)),
+            "title": title,
+            "type": page_type,
+            "grid": None if page_type in FIRMWARE_PAGE_TYPES else {"cols": 4, "rows": 3},
+        })
+        self.pages.append(page)
+        return len(self.pages) - 1
+
+    def duplicate_page(self, index: int) -> int:
+        source = self.pages[index]
+        copied = self.shaped_page(copy.deepcopy(source))
+        copied["id"] = self._unique_page_id(source.get("id") or "page")
+        copied["title"] = f"{source.get('title') or copied['id']} copy"
+        copied["buttons"] = [
+            self._rekeyed_button(button) for button in copied.get("buttons") or []
+        ]
+        # A duplicated page's own nav tiles should point at the copy, not back at the original,
+        # or "duplicate and edit" silently leaves you on the page you were trying to replace.
+        _retarget_page_in(copied, source.get("id"), copied["id"])
+        self.pages.insert(index + 1, copied)
+        return index + 1
+
+    def delete_page(self, index: int) -> None:
+        if len(self.pages) <= 1:
+            raise ModelError("a deck needs at least one page")
+
+        page_id = self.pages[index].get("id")
+        referrers = self.page_referrers(page_id, ignore_page_index=index)
+        if referrers:
+            raise ModelError(
+                f"{len(referrers)} button(s) navigate to {page_id!r}: "
+                + ", ".join(referrers[:4])
+                + ("…" if len(referrers) > 4 else "")
+            )
+        self.pages.pop(index)
+
+    def move_page(self, index: int, delta: int) -> int:
+        target = max(0, min(len(self.pages) - 1, index + delta))
+        if target != index:
+            self.pages.insert(target, self.pages.pop(index))
+        return target
+
+    def rename_page_id(self, index: int, new_id: str) -> None:
+        """Changes a page's id and follows every reference to it.
+
+        Page ids are the deck's only internal links, and a stale one is the same silent failure
+        a stale theme name is: the firmware finds no page, keeps the one it is on, and says
+        nothing. So this is not offered as a choice either.
+        """
+        old = self.pages[index].get("id")
+        if new_id == old:
+            return
+        if any(p.get("id") == new_id for i, p in enumerate(self.pages) if i != index):
+            raise ModelError(f"another page already has the id {new_id!r}")
+
+        self.pages[index]["id"] = new_id
+        if not old:
+            return
+        for page in self.pages:
+            _retarget_page_in(page, old, new_id)
+
+    def set_grid(self, index: int, cols: int, rows: int) -> None:
+        page = self.pages[index]
+        if page.get("type") in FIRMWARE_PAGE_TYPES:
+            raise ModelError(f"a {page.get('type')!r} page draws its own layout")
+        page["grid"] = {"cols": max(1, int(cols)), "rows": max(1, int(rows))}
+
+    def page_referrers(
+        self, page_id: str | None, *, ignore_page_index: int | None = None
+    ) -> list[str]:
+        """Button ids whose action or hold navigates to `page_id`.
+
+        Deleting or parking a page with inbound references refuses and names these. Quietly
+        repointing somebody's nav button is exactly the kind of helpful guess this codebase
+        keeps deciding not to ship — the reference is information, and dropping it loses the
+        one clue about what the page was for.
+        """
+        found: list[str] = []
+        for index, page in enumerate(self.pages):
+            if index == ignore_page_index:
+                continue
+            for button in page.get("buttons") or []:
+                for slot in ("action", "hold"):
+                    if _targets_page(button.get(slot), page_id):
+                        found.append(button.get("id") or f"{page.get('id')}[?]")
+                        break
+        return found
+
+    # -- buttons -------------------------------------------------------------------------
+
+    def new_button(self, page_index: int, label: str = "New button") -> int:
+        page = self.pages[page_index]
+        button = self.shaped_button({
+            **copy.deepcopy(BUTTON_TEMPLATE),
+            "id": self._unique_button_id(_slug(label) or "button"),
+            "label": label,
+        })
+        page.setdefault("buttons", [])
+        page["buttons"].append(button)
+        return len(page["buttons"]) - 1
+
+    def duplicate_button(self, page_index: int, index: int) -> int:
+        buttons = self.pages[page_index]["buttons"]
+        buttons.insert(index + 1, self._rekeyed_button(copy.deepcopy(buttons[index])))
+        return index + 1
+
+    def delete_button(self, page_index: int, index: int) -> None:
+        self.pages[page_index]["buttons"].pop(index)
+
+    def move_button(self, page_index: int, index: int, delta: int) -> int:
+        """Reorders within the page, which for an auto-flow page *is* the layout.
+
+        Costs nothing on the wire, which is why it is the default way to arrange a page: the
+        alternative writes a `pos` on every tile and spends about 300 bytes a page.
+        """
+        buttons = self.pages[page_index]["buttons"]
+        target = max(0, min(len(buttons) - 1, index + delta))
+        if target != index:
+            buttons.insert(target, buttons.pop(index))
+        return target
+
+    def move_button_to_page(self, from_page: int, index: int, to_page: int) -> None:
+        """The no-file version of parking, and the usual answer to "I need room on this page"."""
+        if from_page == to_page:
+            return
+        target = self.pages[to_page]
+        if target.get("type") in FIRMWARE_PAGE_TYPES:
+            raise ModelError(f"a {target.get('type')!r} page cannot hold buttons")
+
+        button = self.pages[from_page]["buttons"].pop(index)
+        # Positions are page-local, and a tile pinned to (3,2) on a 4x3 grid is off the edge of
+        # a 3x2 one. Dropping the pin puts it on the end of the flow, which is visible.
+        button["pos"] = None
+        target.setdefault("buttons", [])
+        target["buttons"].append(button)
+
+    # -- positions -----------------------------------------------------------------------
+
+    def pin_all(self, page_index: int) -> None:
+        """Writes down where auto-flow is currently putting every tile.
+
+        Done as one step rather than per tile because pinning a single tile in place moves nine
+        others: `flow++` fires only in the auto branch, so a pinned tile stops consuming a slot
+        and everything after it shifts back one. Pinning the lot is the only version of this
+        that leaves the page looking the way it looked.
+        """
+        page = self.pages[page_index]
+        cols, rows = _grid_of(page)
+        flow = 0
+        for button in page.get("buttons") or []:
+            pos = button.get("pos") or {}
+            col, row = _as_int(pos.get("col"), -1), _as_int(pos.get("row"), -1)
+            if col < 0 or row < 0:
+                col, row = flow % cols, flow // cols
+                flow += 1
+            button["pos"] = {
+                "col": col,
+                "row": row,
+                "w": max(1, _as_int(pos.get("w"), 1)),
+                "h": max(1, _as_int(pos.get("h"), 1)),
+            }
+
+    def unpin_all(self, page_index: int) -> None:
+        """Back to array order. Frees the bytes, and loses spans and deliberate gaps."""
+        for button in self.pages[page_index].get("buttons") or []:
+            button["pos"] = None
+
+    def is_pinned(self, page_index: int) -> bool:
+        buttons = self.pages[page_index].get("buttons") or []
+        return bool(buttons) and all(b.get("pos") is not None for b in buttons)
+
+    # -- ids -----------------------------------------------------------------------------
+
+    def button_ids(self) -> set[str]:
+        return {
+            button.get("id")
+            for page in self.pages
+            for button in page.get("buttons") or []
+            if button.get("id")
+        }
+
+    def _unique_page_id(self, base: str) -> str:
+        return _unique(base or "page", {p.get("id") for p in self.pages})
+
+    def _unique_button_id(self, base: str) -> str:
+        return _unique(base or "button", self.button_ids())
+
+    def _rekeyed_button(self, button: dict[str, Any]) -> dict[str, Any]:
+        button = self.shaped_button(button)
+        button["id"] = self._unique_button_id(button.get("id") or "button")
+        return button
+
     # -- state ---------------------------------------------------------------------------
 
     @property
@@ -422,6 +648,85 @@ class DeckDoc:
 
         return problems
 
+    def layout_problems(self) -> list[str]:
+        """Geometry the agent's validator has no opinion about and the firmware never logs.
+
+        DeckConfig checks what the format means; this checks what it looks like. The two worst
+        entries here produce nothing at all on the device — a tile past the last column is
+        created at its computed x and extends off the 800px edge, and a seventh nav tab is
+        clipped by a container that does not scroll. From the deck both read as "it is not
+        there", with no log line anywhere.
+        """
+        problems: list[str] = []
+
+        fits = geometry.nav_capacity()
+        if len(self.pages) > fits:
+            problems.append(
+                f"{len(self.pages)} pages, and the nav bar fits {fits} — "
+                f"the last {len(self.pages) - fits} cannot be reached"
+            )
+
+        for page in self.pages:
+            where = page.get("id") or "?"
+            if page.get("type") in FIRMWARE_PAGE_TYPES:
+                continue
+
+            cols, rows = _grid_of(page)
+            cell_w, cell_h = geometry.cells(cols, rows)
+            if cell_w < MIN_TILE_PX or cell_h < MIN_TILE_PX:
+                problems.append(
+                    f"page {where}: a {cols}x{rows} grid gives {cell_w}x{cell_h}px tiles, "
+                    "which is below what a fingertip can reliably hit"
+                )
+
+            occupied: dict[tuple[int, int], str] = {}
+            flow = 0
+            for button in page.get("buttons") or []:
+                button_id = button.get("id") or "?"
+                pos = button.get("pos")
+                w = max(1, _as_int((pos or {}).get("w"), 1))
+                h = max(1, _as_int((pos or {}).get("h"), 1))
+
+                if pos is None:
+                    if w != 1 or h != 1:  # unreachable while pos is None, kept for symmetry
+                        problems.append(f"button {button_id}: a span needs a fixed position")
+                    col, row = flow % cols, flow // cols
+                    flow += 1
+                else:
+                    col = _as_int(pos.get("col"), -1)
+                    row = _as_int(pos.get("row"), -1)
+                    if col < 0 or row < 0:
+                        if w != 1 or h != 1:
+                            problems.append(
+                                f"button {button_id}: pos spans {w}x{h} but has no col/row, "
+                                "and auto-flow ignores the span"
+                            )
+                        col, row = flow % cols, flow // cols
+                        flow += 1
+
+                if col + w > cols:
+                    problems.append(
+                        f"button {button_id}: column {col} + span {w} runs past the "
+                        f"{cols}-column grid on page {where}, and the device says nothing"
+                    )
+                if row + h > rows:
+                    problems.append(
+                        f"button {button_id}: row {row} + span {h} runs past the "
+                        f"{rows}-row grid on page {where}"
+                    )
+
+                for dy in range(h):
+                    for dx in range(w):
+                        cell = (col + dx, row + dy)
+                        if cell in occupied:
+                            problems.append(
+                                f"button {button_id}: overlaps {occupied[cell]} at "
+                                f"({cell[0]}, {cell[1]}) on page {where}"
+                            )
+                        occupied[cell] = button_id
+
+        return problems
+
     def notices(self) -> list[str]:
         """Worth saying, but not worth refusing a save over.
 
@@ -487,3 +792,64 @@ def _retarget_theme(action: Any, old: str, new: str) -> None:
         action["target"] = new
     for step in action.get("steps") or []:
         _retarget_theme(step, old, new)
+
+
+def _retarget_page(action: Any, old: str, new: str) -> None:
+    """The same for `page` targets. Same shape, because the failure is the same shape."""
+    if not isinstance(action, dict):
+        return
+    if action.get("type") == "page" and action.get("target") == old:
+        action["target"] = new
+    for step in action.get("steps") or []:
+        _retarget_page(step, old, new)
+
+
+def _retarget_page_in(page: dict[str, Any], old: str | None, new: str) -> None:
+    if not old:
+        return
+    for button in page.get("buttons") or []:
+        for slot in ("action", "hold"):
+            _retarget_page(button.get(slot), old, new)
+
+
+def _targets_page(action: Any, page_id: str | None) -> bool:
+    if not isinstance(action, dict):
+        return False
+    if action.get("type") == "page" and action.get("target") == page_id:
+        return True
+    return any(_targets_page(step, page_id) for step in action.get("steps") or [])
+
+
+def _as_int(value: Any, fallback: int) -> int:
+    """ArduinoJson's `variant | default`, which is how the firmware reads every pos field."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return fallback
+    return value
+
+
+def _grid_of(page: dict[str, Any]) -> tuple[int, int]:
+    """Mirrors ui_builder.cpp's `page.cols > 0 ? page.cols : 4`."""
+    grid = page.get("grid") or {}
+    cols, rows = _as_int(grid.get("cols"), 0), _as_int(grid.get("rows"), 0)
+    return (cols if cols > 0 else 4, rows if rows > 0 else 3)
+
+
+def _slug(text: str) -> str:
+    """A plain-ASCII id from a label, since ids cross the wire and get compared with `==`."""
+    cleaned = re.sub(r"[^a-z0-9]+", ".", (text or "").lower()).strip(".")
+    return cleaned
+
+
+def _unique(base: str, taken: set) -> str:
+    """`base-2`, not `base 2`.
+
+    Ids are matched exactly by the firmware and appear in `page`/`theme` action targets, so a
+    space in one is a thing that works right up until someone retypes it.
+    """
+    if base not in taken:
+        return base
+    for n in range(2, 1000):
+        candidate = f"{base}-{n}"
+        if candidate not in taken:
+            return candidate
+    return base

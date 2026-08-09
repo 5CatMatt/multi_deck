@@ -28,25 +28,32 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 
 from deckbuilder import icons
+
+# The layout arithmetic lives in geometry.py, which the model and the canvas also use — a preview
+# and a validator that disagreed about where a tile lands would be worse than having neither.
+# Re-exported here because this is where callers have always looked for it.
+from deckbuilder.geometry import (  # noqa: F401
+    NAV_H,
+    PAD,
+    SCREEN_H,
+    SCREEN_W,
+    TAB_H,
+    TAB_STEP,
+    TAB_W,
+    as_int as _int_or,
+    auto_flow,
+    cell_at,
+    cells as _cells,
+    grid_size,
+    tile_box as _tile_box,
+)
 from deckhost import mdi1
 from deckhost.config import is_device_local
 
-# firmware/multi_deck/config.h
-SCREEN_W = 800
-SCREEN_H = 480
-
-# firmware/multi_deck/theme.h:67-72
-NAV_H = 56
-PAD = 8
 CARD_PAD = PAD + 4
 
 # firmware/multi_deck/ui_builder.cpp:273
 ICON_GAP = 6
-
-# Nav tabs: ui_builder.cpp:522 sizes them 120 x NAV_H-16, and :534 steps x by 128.
-TAB_W = 120
-TAB_H = NAV_H - 16
-TAB_STEP = 128
 
 # Status dot: ui_builder.cpp:539-540, right-aligned with a PAD margin, centred in the bar.
 DOT = 14
@@ -408,53 +415,6 @@ def clear_asset_cache() -> None:
 
 
 # -- pages -------------------------------------------------------------------------------
-
-
-def grid_size(grid: dict | None) -> tuple[int, int]:
-    """The columns and rows the firmware would use — ui_builder.cpp:398-399.
-
-    `page.cols > 0 ? page.cols : 4`, which is not the same as "falsy means default": a grid
-    written as `{"cols": -2}` falls back on the device and used to divide by -2 here, producing
-    a preview of a layout that does not exist.
-    """
-    grid = grid or {}
-    cols, rows = grid.get("cols"), grid.get("rows")
-    return (
-        cols if isinstance(cols, int) and not isinstance(cols, bool) and cols > 0 else 4,
-        rows if isinstance(rows, int) and not isinstance(rows, bool) and rows > 0 else 3,
-    )
-
-
-def _cells(cols: int, rows: int) -> tuple[int, int]:
-    """C integer division, deliberately — ui_builder.cpp:400-401.
-
-    (424 - 8*4)//3 is 130, not 130.67, and the 10px left over at the bottom of a 3-row grid is
-    a real gap on the panel. Rounding it away here would make the preview subtly wrong in the
-    one dimension people notice.
-    """
-    return (
-        (SCREEN_W - PAD * (cols + 1)) // cols,
-        (SCREEN_H - NAV_H - PAD * (rows + 1)) // rows,
-    )
-
-
-def _int_or(value: Any, fallback: int) -> int:
-    """ArduinoJson's `variant | default`, which is how every pos field is read.
-
-    deck_config.cpp:287 is `pos["col"] | -1`, and that yields -1 for a *null* variant exactly as
-    it does for an absent key. So `{"col": null, "row": null, "w": 2, "h": 1}` is legal on the
-    device and means "auto-flow, but span two columns" — a shape the editor is about to start
-    writing, and one that used to reach `None < 0` here and take the preview down.
-    """
-    if isinstance(value, bool) or not isinstance(value, int):
-        return fallback
-    return value
-
-
-def _tile_box(col: int, row: int, w: int, h: int, cell_w: int, cell_h: int) -> tuple:
-    x = PAD + col * (cell_w + PAD)
-    y = NAV_H + PAD + row * (cell_h + PAD)
-    return x, y, x + cell_w * w + PAD * (w - 1), y + cell_h * h + PAD * (h - 1)
 
 
 def _draw_grid_page(

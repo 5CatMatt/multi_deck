@@ -2669,6 +2669,456 @@ class GridGeometryTests(unittest.TestCase):
         self.assertEqual(len(fits), 6)
 
 
+class AutoFlowTests(unittest.TestCase):
+    """Where tiles land, and the one line of it that surprises everybody.
+
+    `flow++` fires only in the auto branch (ui_builder.cpp:409-413), so a pinned tile consumes no
+    slot and every auto tile after it shifts back one. That is why the editor pins a whole page at
+    a time and never a single tile — and the strongest statement available about pin_all is that
+    it changes no placement at all.
+    """
+
+    def _doc(self):
+        from deckbuilder.model import DeckDoc
+
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
+
+    def test_pinning_a_page_moves_nothing(self):
+        from deckbuilder import geometry
+
+        doc = self._doc()
+        grids = [i for i, p in enumerate(doc.pages) if p.get("type") == "grid"]
+        before = {p["id"]: geometry.auto_flow(p) for p in doc.pages}
+
+        for index in grids:
+            doc.pin_all(index)
+
+        self.assertEqual({p["id"]: geometry.auto_flow(p) for p in doc.pages}, before)
+        for index in grids:
+            self.assertTrue(doc.is_pinned(index))
+
+    def test_unpinning_returns_the_file_to_where_it_started(self):
+        doc = self._doc()
+        before = json.dumps(doc.pages)
+        doc.pin_all(0)
+        doc.unpin_all(0)
+        self.assertEqual(json.dumps(doc.pages), before)
+
+    def test_pinning_one_tile_in_place_moves_the_others(self):
+        """The measurement the whole Auto/Fixed design falls out of."""
+        from deckbuilder import geometry
+
+        doc = self._doc()
+        page = doc.pages[0]
+        before = geometry.auto_flow(page)
+
+        # Pin the fourth tile exactly where auto-flow already put it.
+        _id, col, row, _w, _h = before[3]
+        page["buttons"][3]["pos"] = {"col": col, "row": row, "w": 1, "h": 1}
+
+        after = geometry.auto_flow(page)
+        moved = [b for b, a in zip(before, after) if b != a]
+        self.assertEqual(len(moved), len(before) - 4, moved)
+
+    def test_pinning_a_page_costs_what_the_plan_measured(self):
+        from deckbuilder import budget
+
+        doc = self._doc()
+        before = budget.frame_bytes(doc.rev, doc.candidate_raw())
+        for index, page in enumerate(doc.pages):
+            if page.get("type") == "grid":
+                doc.pin_all(index)
+
+        after = budget.frame_bytes(doc.rev, doc.candidate_raw())
+        # Not pinned to 600 exactly — the layout is allowed to grow. Pinned to the shape of the
+        # trade: it is hundreds of bytes, which is why it is opt-in and states its price first.
+        self.assertGreater(after - before, 400)
+        self.assertLess(after, budget.LIMIT)
+
+    def test_the_inverse_of_the_grid_is_exactly_the_grid(self):
+        """Every cell of every plausible grid, because a hole here is a tile that is not there."""
+        from deckbuilder import geometry
+
+        for cols in range(1, 9):
+            for rows in range(1, 7):
+                cell_w, cell_h = geometry.cells(cols, rows)
+                if cell_w <= 0 or cell_h <= 0:
+                    continue
+                for col in range(cols):
+                    for row in range(rows):
+                        x0, y0, x1, y1 = geometry.tile_box(col, row, 1, 1, cell_w, cell_h)
+                        with self.subTest(grid=f"{cols}x{rows}", cell=f"{col},{row}"):
+                            self.assertEqual(geometry.cell_at(x0, y0, cols, rows), (col, row))
+                            self.assertEqual(
+                                geometry.cell_at(x1 - 1, y1 - 1, cols, rows), (col, row)
+                            )
+
+    def test_the_gutters_belong_to_no_cell(self):
+        """A drag released in the padding reports nothing rather than guessing at the near side."""
+        from deckbuilder import geometry
+
+        cols, rows = 4, 3
+        cell_w, cell_h = geometry.cells(cols, rows)
+        x0, y0, x1, _y1 = geometry.tile_box(0, 0, 1, 1, cell_w, cell_h)
+
+        self.assertIsNone(geometry.cell_at(x0 - 1, y0, cols, rows))
+        self.assertIsNone(geometry.cell_at(x1, y0, cols, rows))  # first pixel of the gutter
+        self.assertIsNone(geometry.cell_at(x0, geometry.NAV_H // 2, cols, rows))  # the nav bar
+        self.assertIsNone(geometry.cell_at(geometry.SCREEN_W - 1, y0, cols, rows))
+
+    def test_the_nav_bar_capacity_is_six(self):
+        from deckbuilder import geometry
+
+        self.assertEqual(geometry.nav_capacity(), 6)
+        # The seventh starts inside the screen and ends past it, which is the case worth naming:
+        # it is drawn, clipped, and cannot be pressed.
+        seventh = geometry.PAD + 6 * geometry.TAB_STEP
+        self.assertLess(seventh, geometry.SCREEN_W)
+        self.assertGreater(seventh + geometry.TAB_W, geometry.SCREEN_W)
+
+
+class PageOperationTests(unittest.TestCase):
+    """Pages and buttons are references as much as objects, so editing one edits the others."""
+
+    def _doc(self):
+        from deckbuilder.model import DeckDoc
+
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
+
+    def test_renaming_a_page_follows_every_nav_button(self):
+        doc = self._doc()
+        index = doc.page_index("macros")
+        self.assertTrue(doc.page_referrers("macros"))
+
+        doc.rename_page_id(index, "macro.pad")
+        self.assertEqual(doc.page_referrers("macros"), [])
+        self.assertTrue(doc.page_referrers("macro.pad"))
+        self.assertEqual(doc.problems(), [])
+
+    def test_deleting_a_referenced_page_refuses_and_names_the_referrers(self):
+        """Silently repointing somebody's nav tile would lose the only clue about its purpose."""
+        from deckbuilder.model import ModelError
+
+        doc = self._doc()
+        with self.assertRaises(ModelError) as caught:
+            doc.delete_page(doc.page_index("macros"))
+        self.assertIn("nav.macros", str(caught.exception))
+
+    def test_a_duplicated_page_points_at_itself(self):
+        doc = self._doc()
+        source = doc.pages[0]["id"]
+        doc.pages[0]["buttons"][0]["action"] = {"type": "page", "target": source}
+
+        index = doc.duplicate_page(0)
+        copied = doc.pages[index]
+        self.assertNotEqual(copied["id"], source)
+        self.assertEqual(copied["buttons"][0]["action"]["target"], copied["id"])
+        self.assertEqual(doc.shape_problems(), [])
+        self.assertEqual(doc.problems(), [])
+
+    def test_new_ids_are_unique_and_carry_no_spaces(self):
+        doc = self._doc()
+        doc.new_page("Launch")
+        doc.new_button(0, "VS Code")
+
+        ids = [p["id"] for p in doc.pages] + sorted(doc.button_ids())
+        self.assertEqual(len(ids), len(set(ids)))
+        for value in ids:
+            with self.subTest(id=value):
+                self.assertNotIn(" ", value)
+
+    def test_moving_a_button_between_pages_drops_its_position(self):
+        """A pin is page-local: (3,2) on a 4x3 grid is off the edge of a 3x2 one."""
+        doc = self._doc()
+        doc.pin_all(0)
+        moved = doc.pages[0]["buttons"][5]["id"]
+
+        doc.move_button_to_page(0, 5, 1)
+        landed = doc.pages[1]["buttons"][-1]
+        self.assertEqual(landed["id"], moved)
+        self.assertIsNone(landed["pos"])
+
+    def test_a_firmware_page_refuses_buttons_and_a_grid(self):
+        from deckbuilder.model import ModelError
+
+        doc = self._doc()
+        numpad = doc.page_index("numpad")
+        with self.assertRaises(ModelError):
+            doc.set_grid(numpad, 4, 3)
+        with self.assertRaises(ModelError):
+            doc.move_button_to_page(0, 0, numpad)
+
+    def test_the_shipped_layout_has_no_geometry_problems(self):
+        self.assertEqual(self._doc().layout_problems(), [])
+
+    def test_overlapping_pins_are_caught(self):
+        doc = self._doc()
+        doc.pin_all(0)
+        doc.pages[0]["buttons"][1]["pos"] = dict(doc.pages[0]["buttons"][0]["pos"])
+        self.assertIn("overlaps", " | ".join(doc.layout_problems()))
+
+    def test_a_grid_too_fine_to_press_is_caught(self):
+        from deckbuilder import geometry
+        from deckbuilder.model import MIN_TILE_PX
+
+        # 8x6 is 91x61px, which squeaks past — the threshold is drawn at roughly a fingertip on
+        # a 7" panel, and being close to it is not the same as being over it.
+        self.assertGreaterEqual(min(geometry.cells(8, 6)), MIN_TILE_PX)
+
+        doc = self._doc()
+        doc.set_grid(0, 8, 7)
+        self.assertIn("fingertip", " | ".join(doc.layout_problems()))
+
+    def test_more_pages_than_the_nav_holds_is_caught(self):
+        doc = self._doc()
+        while len(doc.pages) <= 6:
+            doc.new_page(f"Spare {len(doc.pages)}")
+        self.assertIn("cannot be reached", " | ".join(doc.layout_problems()))
+
+    def test_the_boot_page_is_named_so_a_reorder_can_mention_it(self):
+        doc = self._doc()
+        self.assertEqual(doc.boot_page, doc.pages[0]["id"])
+        doc.move_page(1, -1)
+        self.assertEqual(doc.boot_page, doc.pages[0]["id"])
+
+
+class LibraryTests(unittest.TestCase):
+    """Parking something has to be reversible, or nobody will use it on anything they care about."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+        import shutil
+
+        self.root = self.tmp / "sdcard"
+        shutil.copytree(REPO / "sdcard", self.root)
+
+    def _doc(self):
+        from deckbuilder.model import DeckDoc
+
+        return DeckDoc.load(self.root / "deck.json")
+
+    def test_a_parked_page_comes_back_identical(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        before = json.loads(json.dumps(doc.pages[doc.page_index("calendar")]))
+
+        path, freed = library.park(
+            doc, "page", [doc.page_index("calendar")], self.tmp / "calendar.mdpart.json"
+        )
+        self.assertGreater(freed, 0)
+        self.assertNotIn("calendar", [p["id"] for p in doc.pages])
+
+        plan = library.plan_import(doc, library.read(path))
+        self.assertEqual(plan.problems, [])
+        library.apply(doc, plan)
+
+        self.assertEqual(doc.pages[doc.page_index("calendar")], before)
+        self.assertEqual(doc.shape_problems(), [])
+        self.assertEqual(doc.problems(), [])
+
+    def test_nothing_is_removed_until_the_file_reads_back(self):
+        """The ordering that makes park safe to use on something you cannot rebuild."""
+        import ast
+
+        source = (REPO / "agent" / "deckbuilder" / "library.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        park = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "park"
+        )
+        calls = [
+            node.func.id
+            for node in ast.walk(park)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        self.assertLess(calls.index("export"), calls.index("read"))
+        self.assertLess(calls.index("read"), calls.index("_remove"))
+
+    def test_parking_a_referenced_page_refuses_and_keeps_the_file(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = self.tmp / "macros.mdpart.json"
+        with self.assertRaises(library.LibraryError) as caught:
+            library.park(doc, "page", [doc.page_index("macros")], path)
+
+        self.assertIn("nothing was removed", str(caught.exception))
+        self.assertTrue(path.is_file(), "the copy was written and must not be thrown away")
+        self.assertIn("macros", [p["id"] for p in doc.pages])
+
+    def test_importing_the_same_thing_twice_uniques_rather_than_collides(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "theme", [0], self.tmp / "one.mdpart.json")
+        fragment = library.read(path)
+
+        for _ in range(2):
+            plan = library.plan_import(doc, fragment)
+            library.apply(doc, plan)
+
+        names = [t["name"] for t in doc.themes]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(doc.problems(), [])
+
+    def test_a_whole_deck_is_a_valid_source(self):
+        """Which is what makes the backup folder an undo-across-sessions."""
+        from deckbuilder import library
+
+        fragment = library.read(self.root / "deck.json")
+        self.assertEqual(fragment.source, "deck")
+        self.assertEqual(fragment.kind, "theme")
+
+        raw = json.loads((self.root / "deck.json").read_bytes().decode("utf-8"))
+        as_pages = library.pick(fragment, "page", raw)
+        self.assertEqual([p["id"] for p in as_pages.items], [p["id"] for p in raw["pages"]])
+
+    def test_a_newer_item_is_refused_rather_than_quietly_trimmed(self):
+        """Dropping a key the firmware reads changes behaviour, silently, on the deck."""
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "theme", [0], self.tmp / "one.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["items"][0]["glow"] = 40
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        plan = library.plan_import(doc, library.read(path))
+        self.assertFalse(plan.ok)
+        self.assertIn("glow", " | ".join(plan.problems))
+
+    def test_an_older_item_is_filled_in_and_said_so(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "theme", [0], self.tmp / "one.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["items"][0]["dim_opa"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        plan = library.plan_import(doc, library.read(path))
+        self.assertTrue(plan.ok)
+        self.assertIn("dim_opa", " | ".join(plan.notes))
+        self.assertIsNone(plan.items[0]["dim_opa"], "must default to config.h, not to a literal")
+        self.assertEqual(tuple(plan.items[0]), doc.field_order)
+
+    def test_the_cost_is_known_before_anything_is_committed(self):
+        """Import is where the budget actually gets blown."""
+        from deckbuilder import budget, library
+
+        doc = self._doc()
+        path = library.export(doc, "page", [0], self.tmp / "page.mdpart.json")
+        plan = library.plan_import(doc, library.read(path))
+
+        before = budget.frame_bytes(doc.next_rev(), doc.candidate_raw())
+        library.apply(doc, plan)
+        after = budget.frame_bytes(doc.next_rev(), doc.candidate_raw())
+
+        self.assertEqual(plan.bytes_delta, after - before)
+        self.assertEqual(plan.used_after, after)
+
+    def test_a_missing_wallpaper_is_reported_before_the_import_lands(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        fragment = library.read(self.root / "deck.json")
+        fragment.items = [dict(fragment.items[0], name="Ghost", wallpaper="/wall/absent.bin")]
+
+        plan = library.plan_import(doc, fragment)
+        self.assertEqual(plan.missing_assets, ["/wall/absent.bin"])
+
+    def test_the_manifest_describes_assets_rather_than_carrying_them(self):
+        """A wallpaper is 768KB, and the file's virtue is that you can open and read it."""
+        from deckbuilder import library
+
+        doc = self._doc()
+        themed = next(
+            (i for i, t in enumerate(doc.themes) if (t.get("wallpaper") or "").startswith("/")),
+            None,
+        )
+        if themed is None:
+            self.skipTest("no theme in the shipped deck uses a wallpaper")
+
+        path = library.export(doc, "theme", [themed], self.tmp / "wall.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(data["assets"])
+        entry = data["assets"][0]
+        self.assertEqual(set(entry), {"path", "sha256", "bytes"})
+        self.assertLess(path.stat().st_size, 32_000, "the manifest turned into a payload")
+
+    def test_a_button_loses_a_pin_it_cannot_honour(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        doc.pin_all(0)
+        path = library.export(doc, "button", [3], self.tmp / "one.mdpart.json", page_index=0)
+
+        plan = library.plan_import(doc, library.read(path), into_page=1)
+        self.assertIsNone(plan.items[0]["pos"])
+        self.assertIn("dropped its fixed position", " | ".join(plan.notes))
+
+    def test_a_page_keeps_pins_that_came_with_their_grid(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        doc.pin_all(0)
+        expected = json.loads(json.dumps(doc.pages[0]["buttons"][0]["pos"]))
+
+        path = library.export(doc, "page", [0], self.tmp / "page.mdpart.json")
+        plan = library.plan_import(doc, library.read(path))
+        self.assertEqual(plan.items[0]["buttons"][0]["pos"], expected)
+
+    def test_a_dangling_nav_target_is_named_at_import_time(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "page", [0], self.tmp / "page.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["items"][0]["buttons"][0]["action"] = {"type": "page", "target": "nowhere"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        plan = library.plan_import(doc, library.read(path))
+        self.assertIn("nowhere", " | ".join(plan.notes))
+
+    def test_a_file_that_is_neither_is_refused_by_name(self):
+        from deckbuilder import library
+
+        path = self.tmp / "random.json"
+        path.write_text('{"hello": 1}', encoding="utf-8")
+        with self.assertRaises(library.LibraryError):
+            library.read(path)
+
+    def test_a_future_format_version_is_refused(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "theme", [0], self.tmp / "one.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["multi_deck"] = 99
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(library.LibraryError):
+            library.read(path)
+
+    def test_a_parked_file_says_where_it_came_from(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "button", [2], self.tmp / "one.mdpart.json", page_index=0)
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(data["from"]["rev"], doc.rev)
+        self.assertEqual(data["origin"]["page"], doc.pages[0]["id"])
+        self.assertEqual(data["kind"], "button")
+
+
 class ByteBudgetTests(unittest.TestCase):
     """The meter has to measure the thing that actually fails, not an approximation of it."""
 
