@@ -21,32 +21,36 @@ big for the link, so they only reach the card by hand — see [Wallpapers](#wall
 `sdcard/assets.ver` is a generated hash of everything else in `sdcard/`; leave it alone and let
 `tools/make_assets.py` write it. It is how the deck knows to tell you the card needs rewriting.
 
-## Editing colours with the theme builder
+## The editor
 
-Colours are the part of this file worth having a window for. Every theme token fails the same
-quiet way — a colour the firmware cannot parse leaves the built-in default in place, which looks
-exactly like the edit never arrived — and the only way to see what a value actually does is to
-put it on the panel and look.
+Most of this file is worth having a window for. Every theme token fails the same quiet way — a
+colour the firmware cannot parse leaves the built-in default in place, which looks exactly like
+the edit never arrived — and the only way to see what a value actually does is to put it on the
+panel and look.
 
 ```
 python tools/theme_builder.py
 ```
 
-It edits `themes` and `settings` only, and shows an 800×480 preview of your real pages rendered
+It owns `themes`, `settings` and `pages`, and shows an 800×480 preview of your real pages rendered
 from the same rules the firmware uses: gradients, per-tile opacity, corner radii, borders, the
-`display` chain, and which tiles grey out when the agent is closed. Pages, buttons and actions
-are read for the preview but never rewritten, so nothing below `"pages"` in the file is touched.
+`display` chain, and which tiles grey out when the agent is closed. Anything else in the file is
+carried through a save untouched, and the writer asserts that rather than assuming it.
 
-Three things it does that hand-editing does not:
+Four things it does that hand-editing does not:
 
 - **Writes `rev` for you.** Every save that changes something bumps it, which is what makes the
   change survive a replug rather than only a tray reload — see [below](#the-other-way--bump-rev).
 - **Shows the layout's wire size** against the 8192-byte line limit, with the warning line at
-  80% where `tools/protocol_test.py` starts failing. Adding themes is the easiest way to walk
-  into that limit, and it is the one that fails silently.
+  80% where `tools/protocol_test.py` starts failing, and a per-item cost on every row. Every
+  command that adds something says what it costs *before* it commits, because the limit is the
+  one that fails silently.
 - **Keeps "unset" writable.** Every nullable field has a *Default* tick beside it, so `dim_opa`
   and `flip180` can stay `null` and keep deferring to `config.h` rather than being pinned to
   whatever the slider happened to read.
+- **Refuses to write a layout the agent would reject**, with one explicit override. The agent
+  exits rather than loading a bad file, and it starts at logon — so the cost of saving one is
+  that the agent is quietly not running the next time you look.
 
 It never opens the serial port, so it does not fight the running agent and works with the deck
 unplugged. Saving is still only half the job: reload from the tray afterwards, exactly as if you
@@ -62,6 +66,60 @@ pyinstaller agent/deckbuilder/deckbuilder.spec --noconfirm \
 
 Fonts and icons in the preview are substitutes — the deck's are compiled into the firmware and
 do not exist on the PC — and the window says so under the canvas. Everything else is exact.
+
+### The Layout tab
+
+A tree of pages and their buttons, with byte costs, over an editor for the selected tile.
+
+Buttons can be added, duplicated, deleted, reordered and moved between pages; pages the same,
+plus a grid size. Renaming a page id follows every nav button that points at it, and deleting a
+page that something navigates to **refuses and names the referrers** — silently repointing a nav
+tile loses the only clue about what the page was for. `pages[0]` is the boot page with nothing in
+the format naming it, so anything that changes which page is first says so.
+
+Tiles can be dragged in the preview, and what a drag does depends on the page:
+
+| Mode | Drag does | Costs |
+|---|---|---|
+| **Auto** (default) | reorders the array, which *is* the layout | nothing |
+| **Fixed** | writes `col`/`row` | ~300 bytes per page |
+
+Auto is the default because of two measurements. Writing positions on both grid pages costs 600
+bytes, which is most of what is left before the warning line; and pinning a *single* tile in place
+moves nine others, because the firmware's `flow++` only fires for tiles it is placing itself, so a
+pinned tile stops consuming a slot. Fixed is therefore per page and all-or-nothing, and it tells
+you the price before writing anything. You need it for spans and for deliberate gaps; you do not
+need it to put the tiles in a different order.
+
+The action editor is a one-line form for the common types over a JSON box that is always visible
+and always authoritative. `seq`, or an action carrying a key the form does not model, greys the
+form and says so — it will never quietly drop a field it does not understand. Long presses are
+edited through the same controls by a toggle, which is the only place in this system a `hold` is
+visible at all.
+
+### The library
+
+The byte limit is the real constraint on this file, and two thirds of it is pages and buttons. So
+things can be **parked**: written to a file, taken out of the deck, and imported back later.
+
+- **Park…** writes the selected page, button or theme to a file and then removes it — in that
+  order, verifying the file reads back before anything is deleted.
+- **Export…** writes a copy and changes nothing.
+- **Import…** reads a library file *or* a whole `deck.json`, so a theme can be lifted straight out
+  of somebody else's layout.
+- **From a backup…** points the same reader at `%LOCALAPPDATA%\multi_deck\backups\`, where the
+  editor already keeps the last twenty versions. That makes it an undo that survives closing the
+  app.
+
+Library files are plain JSON with a manifest of the images an item needs — path, hash and size,
+not the image itself, which would be a megabyte of base64 in a file whose main virtue is that you
+can read it. Import tells you what is missing before it commits, and what the import will cost:
+*adds 1,835 bytes → 7,640 / 8,192 (93%), past the warning line.* Import is where the budget
+actually gets blown, so that is where the number belongs.
+
+Collisions unique themselves (`launch` → `launch-2`), and an imported page's own nav tiles follow
+the new id. An item from a newer firmware — one carrying a key this deck does not have — is
+refused with the extra keys named, rather than trimmed to fit.
 
 ## Getting a change onto the deck
 
@@ -439,17 +497,27 @@ describe — so it is built in code.
 
 The agent checks the file before pushing and rejects it on:
 
-- a button with no `id`
-- duplicate `id`s
-- an action with no `type`
+- a button with no `id`, or duplicate button or page `id`s
+- an action with no `type`, or a type that is not one the firmware or agent runs
+- an action missing the one field that makes it do anything — `launch.target`, `shell.cmd`,
+  `ahk.fn`, `hid.keys`, `hid_text.text`, `media.key`, `delay.ms`, `seq.steps`
 - a `page` action pointing at a page that does not exist
 - a `theme` action naming a theme that does not exist
 - `settings.theme` naming a theme that does not exist
+- a `media.key` the device does not know, or a `hid` chord it would reject — an unknown token, or
+  more than six non-modifier keys
 - a colour, number, `display` or `flip180` of the wrong *type* — six hex digits, a whole number,
   one of the three modes, a boolean
 
-The middle three are the valuable checks. Without them a typo'd target produces a button that
-looks perfectly normal and silently does nothing.
+All of it applies to `hold` as well as to `action`.
+
+The reference checks are the valuable ones. Without them a typo'd target produces a button that
+looks perfectly normal and silently does nothing. The same is true of the chord checks: the
+firmware refuses a chord containing one token it cannot resolve — not the token, the *whole
+chord* — and logs it to a serial port nothing is attached to.
+
+`ahk.fn` **warns** rather than failing, because `agent/ahk/lib.ahk` is yours to edit and an
+unrecognised name is as likely to be a helper you have not written yet as a typo.
 
 The type checks all accept the written form of unset: `null` for numbers, booleans and colours,
 `""` for `display`, `icon` and `wallpaper`. That is what lets every object in the file carry the
