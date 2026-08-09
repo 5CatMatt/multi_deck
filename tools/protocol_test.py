@@ -2018,6 +2018,28 @@ class ImagePipelineTests(unittest.TestCase):
                     "app.py reads sys.executable, which in a frozen build is the builder itself",
                 )
 
+    def test_every_check_the_save_button_is_given_is_a_check_it_makes(self):
+        """`_can_save(self, problems)` took the validator's list and never looked at it.
+
+        It read as though the check existed, so the save button stayed lit for a layout the
+        agent refuses — which makes the agent exit 2 at logon, and the deck keeps whatever it
+        had. Static, because reaching this through tkinter means standing up a window.
+        """
+        import ast
+
+        tree = ast.parse((REPO / "agent" / "deckbuilder" / "app.py").read_text(encoding="utf-8"))
+        target = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_can_save"
+        )
+
+        parameters = [arg.arg for arg in target.args.args if arg.arg != "self"]
+        used = {node.id for node in ast.walk(target) if isinstance(node, ast.Name)}
+        for name in parameters:
+            with self.subTest(parameter=name):
+                self.assertIn(name, used, f"_can_save takes {name!r} and ignores it")
+
     def test_wallpaper_fills_the_panel_from_any_aspect_ratio(self):
         import tempfile
 
@@ -2432,6 +2454,221 @@ class ThemeShapeTests(unittest.TestCase):
             doc.delete(0)
 
 
+class LayoutShapeTests(unittest.TestCase):
+    """Pages and buttons follow the rule themes already followed: one key set, one order.
+
+    ConfigShapeTests enforces it on what is committed; these enforce it on what the editor would
+    produce. The editor is about to start writing both, and the writer will no longer catch a
+    drifted shape structurally — a dump writes whatever it is handed.
+    """
+
+    def _doc(self):
+        from deckbuilder.model import DeckDoc
+
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
+
+    def _deck(self) -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"))
+
+    def test_the_hardcoded_orders_match_the_shipped_file(self):
+        from deckbuilder.model import BUTTON_FIELD_ORDER, PAGE_FIELD_ORDER
+
+        deck = self._deck()
+        first_button = next(
+            b for p in deck["pages"] for b in (p.get("buttons") or [])
+        )
+        self.assertEqual(PAGE_FIELD_ORDER, tuple(deck["pages"][0]))
+        self.assertEqual(BUTTON_FIELD_ORDER, tuple(first_button))
+
+    def test_the_templates_cover_every_field(self):
+        from deckbuilder.model import (
+            BUTTON_FIELD_ORDER,
+            BUTTON_TEMPLATE,
+            PAGE_FIELD_ORDER,
+            PAGE_TEMPLATE,
+        )
+
+        self.assertEqual(set(PAGE_TEMPLATE), set(PAGE_FIELD_ORDER))
+        self.assertEqual(set(BUTTON_TEMPLATE), set(BUTTON_FIELD_ORDER))
+
+    def test_the_shipped_file_has_no_shape_problems(self):
+        self.assertEqual(self._doc().shape_problems(), [])
+        self.assertEqual(self._doc().notices(), [])
+
+    def test_the_button_shape_comes_from_the_first_button_anywhere(self):
+        """A deck whose first page is the ten-key has no buttons on pages[0]."""
+        from deckbuilder.model import BUTTON_FIELD_ORDER, DeckDoc
+
+        deck = self._deck()
+        deck["pages"] = [p for p in deck["pages"] if p["id"] == "numpad"] + [
+            p for p in deck["pages"] if p["id"] != "numpad"
+        ]
+        doc = DeckDoc(
+            path=REPO / "sdcard" / "deck.json", original="", raw=deck,
+            themes=deck["themes"], settings=deck["settings"], pages=deck["pages"],
+            field_order=tuple(deck["themes"][0]),
+            page_order=tuple(deck["pages"][0]),
+            button_order=DeckDoc._order_of(DeckDoc._first_button(deck["pages"]), ()),
+        )
+        self.assertEqual(doc.button_order, BUTTON_FIELD_ORDER)
+
+    def test_a_pos_is_null_or_all_four_in_order(self):
+        doc = self._doc()
+        button = doc.pages[0]["buttons"][0]
+
+        button["pos"] = {"col": 1, "row": 0, "w": 1, "h": 1}
+        self.assertEqual(doc.shape_problems(), [])
+
+        button["pos"] = {"col": 1, "row": 0}
+        self.assertIn("pos must be null", " | ".join(doc.shape_problems()))
+
+        button["pos"] = {"row": 0, "col": 1, "w": 1, "h": 1}
+        self.assertIn("in that order", " | ".join(doc.shape_problems()))
+
+        button["pos"] = {"col": "1", "row": 0, "w": 1, "h": 1}
+        self.assertIn("pos.col is '1'", " | ".join(doc.shape_problems()))
+
+    def test_a_firmware_page_carrying_a_grid_or_buttons_is_caught(self):
+        """Both are parsed, ignored, and paid for in wire bytes forever."""
+        doc = self._doc()
+        numpad = next(p for p in doc.pages if p["type"] == "numpad")
+
+        numpad["grid"] = {"cols": 4, "rows": 3}
+        self.assertIn("grid should be null", " | ".join(doc.shape_problems()))
+
+        numpad["grid"] = None
+        numpad["buttons"] = [json.loads(json.dumps(doc.pages[0]["buttons"][0]))]
+        self.assertIn("never built", " | ".join(doc.shape_problems()))
+
+    def test_a_drifted_first_button_is_reported_rather_than_adopted_in_silence(self):
+        """The hole in shape_problems(): it compares against the order derived from the file."""
+        from deckbuilder.model import DeckDoc
+
+        deck = self._deck()
+        for page in deck["pages"]:
+            for button in page.get("buttons") or []:
+                button["stat"] = None
+
+        doc = DeckDoc(
+            path=REPO / "sdcard" / "deck.json", original="", raw=deck,
+            themes=deck["themes"], settings=deck["settings"], pages=deck["pages"],
+            field_order=tuple(deck["themes"][0]),
+            page_order=tuple(deck["pages"][0]),
+            button_order=DeckDoc._order_of(DeckDoc._first_button(deck["pages"]), ()),
+        )
+
+        # Adopted, so a new firmware field needs no change here...
+        self.assertEqual(doc.shape_problems(), [])
+        # ...but said out loud, because the other way to get here is a bad hand edit.
+        self.assertIn("extra: stat", " | ".join(doc.notices()))
+
+
+class GridGeometryTests(unittest.TestCase):
+    """The preview has to place tiles exactly where ui_builder.cpp would, including the edges.
+
+    `col >= cols` has no firmware log at all — the tile is created at its computed x and simply
+    extends past the 800px edge — so a hole in this arithmetic shows up on the deck as a tile
+    that is not there, with nothing anywhere saying why.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+
+    def _deck(self) -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"))
+
+    def test_the_grid_fallback_matches_the_firmware(self):
+        from deckbuilder.render import grid_size
+
+        source = (REPO / "firmware" / "multi_deck" / "ui_builder.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(source, r"cols\s*>\s*0\s*\?\s*.*?cols\s*:\s*4")
+        self.assertRegex(source, r"rows\s*>\s*0\s*\?\s*.*?rows\s*:\s*3")
+
+        self.assertEqual(grid_size({"cols": 5, "rows": 4}), (5, 4))
+        self.assertEqual(grid_size({"cols": 0, "rows": 0}), (4, 3))
+        self.assertEqual(grid_size({"cols": -2, "rows": -1}), (4, 3))
+        self.assertEqual(grid_size({"cols": None, "rows": None}), (4, 3))
+        self.assertEqual(grid_size(None), (4, 3))
+
+    def test_a_null_pos_with_a_span_renders(self):
+        """Legal on the device — ArduinoJson's `|` treats null and absent alike — and it used
+        to crash the preview with `None < 0`."""
+        from deckbuilder import render
+
+        deck = self._deck()
+        deck["pages"][0]["buttons"][0]["pos"] = {"col": None, "row": None, "w": 2, "h": 1}
+        preview = render.render_page(
+            deck, deck["themes"][0], "launch", asset_root=REPO / "sdcard"
+        )
+        self.assertEqual(preview.warnings, [])
+
+    def test_the_pos_fields_are_read_the_way_arduinojson_reads_them(self):
+        from deckbuilder.render import _int_or
+
+        source = (REPO / "firmware" / "multi_deck" / "deck_config.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('pos["col"] | -1', source)
+        self.assertIn('pos["w"] | 1', source)
+
+        self.assertEqual(_int_or(None, -1), -1)
+        self.assertEqual(_int_or("2", -1), -1)
+        self.assertEqual(_int_or(True, -1), -1)
+        self.assertEqual(_int_or(0, -1), 0)
+        self.assertEqual(_int_or(3, -1), 3)
+
+    def test_a_tile_that_spans_off_the_grid_is_reported(self):
+        from deckbuilder import render
+
+        deck = self._deck()
+        deck["pages"][0]["buttons"][0]["pos"] = {"col": 3, "row": 0, "w": 2, "h": 1}
+        preview = render.render_page(
+            deck, deck["themes"][0], "launch", asset_root=REPO / "sdcard"
+        )
+        self.assertIn("past the 4-column grid", " | ".join(preview.warnings))
+
+    def test_the_nav_bar_draws_what_the_firmware_draws(self):
+        """The firmware creates every tab and lets the container clip it; this used to break.
+
+        Which made the preview look clean at exactly the point the deck becomes unusable.
+        """
+        from deckbuilder import render
+
+        source = (REPO / "firmware" / "multi_deck" / "ui_builder.cpp").read_text(
+            encoding="utf-8"
+        )
+        nav = re.search(r"void buildNav.*?\n\}", source, re.S)
+        self.assertIsNotNone(nav, "could not find buildNav in ui_builder.cpp")
+        self.assertNotIn("break", nav.group(0), "the firmware now stops early; so should we")
+
+        deck = self._deck()
+        spare = json.loads(json.dumps(deck["pages"][-1]))
+        for index in range(2):
+            extra = json.loads(json.dumps(spare))
+            extra["id"], extra["title"] = f"extra{index}", f"Extra {index}"
+            deck["pages"].append(extra)
+
+        preview = render.render_page(
+            deck, deck["themes"][0], "launch", asset_root=REPO / "sdcard"
+        )
+        self.assertIn("cut off at the edge", " | ".join(preview.warnings))
+
+    def test_six_tabs_fit_and_the_seventh_does_not(self):
+        from deckbuilder import render
+
+        fits = [
+            index
+            for index in range(10)
+            if render.PAD + index * render.TAB_STEP + render.TAB_W <= render.SCREEN_W
+        ]
+        self.assertEqual(len(fits), 6)
+
+
 class ByteBudgetTests(unittest.TestCase):
     """The meter has to measure the thing that actually fails, not an approximation of it."""
 
@@ -2483,8 +2720,56 @@ class ByteBudgetTests(unittest.TestCase):
     def test_the_shipped_layout_is_not_already_warning(self):
         from deckbuilder import budget
 
+        # The property, not the enum it currently produces. Asserting "near" would start failing
+        # for a layout that got *smaller*, which is not a regression in anything.
         raw = self._raw()
-        self.assertEqual(budget.report(raw["rev"], raw).level, "near")
+        report = budget.report(raw["rev"], raw)
+        self.assertLess(report.used, report.warn_at)
+
+    def test_the_meter_measures_the_same_way_the_encoder_does(self):
+        """The mismatch that made this under-report: ensure_ascii, set two different ways."""
+        from deckbuilder import budget
+
+        raw = self._raw()
+        before = budget.frame_bytes(raw["rev"], raw)
+        theme = json.loads(json.dumps(raw["themes"][0]))
+        theme["name"] = "Café"
+
+        raw["themes"].append(theme)
+        self.assertEqual(before + budget.item_cost(theme), budget.frame_bytes(raw["rev"], raw))
+
+    def test_a_page_costs_what_the_meter_says_it_costs(self):
+        from deckbuilder import budget
+
+        raw = self._raw()
+        before = budget.frame_bytes(raw["rev"], raw)
+        page = json.loads(json.dumps(raw["pages"][0]))
+        page["id"] = "copy"
+
+        raw["pages"].append(page)
+        self.assertEqual(before + budget.page_cost(page), budget.frame_bytes(raw["rev"], raw))
+
+    def test_removing_something_is_measured_rather_than_estimated(self):
+        """The number that appears next to a button someone is about to press."""
+        from deckbuilder import budget
+
+        raw = self._raw()
+        freed = budget.removal_cost(raw["rev"], raw, lambda after: after["pages"].pop(0))
+
+        after = json.loads(json.dumps(raw))
+        after["pages"].pop(0)
+        self.assertEqual(
+            freed, budget.frame_bytes(raw["rev"], raw) - budget.frame_bytes(raw["rev"], after)
+        )
+        self.assertGreater(freed, 0)
+
+    def test_removal_cost_does_not_disturb_the_layout_it_measures(self):
+        from deckbuilder import budget
+
+        raw = self._raw()
+        untouched = json.dumps(raw)
+        budget.removal_cost(raw["rev"], raw, lambda after: after["pages"].clear())
+        self.assertEqual(json.dumps(raw), untouched)
 
 
 class BuilderIconTests(unittest.TestCase):

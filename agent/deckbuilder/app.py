@@ -122,6 +122,8 @@ class BuilderApp:
         self._pending: str | None = None
         self._loading = False
         self._scroll_panes: list[tuple[tk.Canvas, int, ttk.Frame]] = []
+        self._problem_signature: tuple = ()
+        self._override = False
 
         writer.sweep_temp_files(path.parent)
 
@@ -616,16 +618,39 @@ class BuilderApp:
         self.meter_detail.configure(text=report.detail())
 
     def _draw_problems(self) -> None:
-        problems = self.doc.shape_problems() + self.doc.problems()
+        shape = self.doc.shape_problems()
+        problems = self.doc.problems()
+        notices = self.doc.notices()
+
+        lines = [f"• {p}" for p in shape + problems] + [f"– {n}" for n in notices]
         self.problems.configure(state="normal")
         self.problems.delete("1.0", "end")
-        self.problems.insert("1.0", "\n".join(f"• {p}" for p in problems)
-                             if problems else "Nothing wrong with this layout.")
+        self.problems.insert("1.0", "\n".join(lines) if lines
+                             else "Nothing wrong with this layout.")
         self.problems.configure(state="disabled")
-        self.save_button.configure(state="normal" if self._can_save(problems) else "disabled")
 
-    def _can_save(self, problems: list[str]) -> bool:
-        if self.doc.shape_problems():
+        # Arming the override is per problem list, not per session: fix one thing and the next
+        # Save asks again, rather than quietly carrying permission over to a different mistake.
+        signature = (tuple(shape), tuple(problems))
+        if signature != self._problem_signature:
+            self._problem_signature = signature
+            self._override = False
+
+        self.save_button.configure(state="normal" if self._can_save(shape) else "disabled")
+
+    def _can_save(self, shape_problems: list[str]) -> bool:
+        """Whether Save is even offered — the two things clicking again cannot fix.
+
+        Deliberately *not* fed the validator's list. That list is offered with an override,
+        because the person editing may know something the validator does not and the file is
+        theirs. These two are different: a drifted key set would be written by the dump exactly
+        as handed to it, and an over-limit frame is discarded by the deck in silence. Neither
+        has a "yes I meant it" that produces a working deck.
+
+        The earlier version of this method took the validator's list as an argument and then
+        ignored it, which read as though the check existed.
+        """
+        if shape_problems:
             return False
         return not budget.report(self.doc.next_rev(), self.doc.candidate_raw()).over_limit
 
@@ -733,6 +758,23 @@ class BuilderApp:
         report = budget.report(rev, self.doc.candidate_raw())
         if report.over_limit:
             self._say(f"Refusing to write: {report.summary()}. {report.detail()}", "error")
+            return
+
+        # The agent refuses a layout with problems and exits, and it starts at logon — so this
+        # is not a warning about the deck looking wrong, it is a warning about the deck stopping
+        # working until someone opens a log. Overridable, because the person editing may be
+        # about to add the page the dangling reference points at, and it is their file.
+        problems = self.doc.problems()
+        if problems and not self._override:
+            self._override = True
+            more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+            self._say(
+                f"Refusing to write: {problems[0]}{more}"
+                "\n\nClick Save again to write it anyway. The agent refuses a layout with "
+                "problems, so it will not start at logon and the deck keeps the layout it "
+                "already has.",
+                "error",
+            )
             return
 
         try:

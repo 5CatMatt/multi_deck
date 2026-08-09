@@ -78,6 +78,46 @@ THEME_TEMPLATE: dict[str, Any] = {
 }
 
 
+# Pages and buttons follow the same rule as themes: one key set, one order, unset written down.
+# Derived from the file being edited, with these as the fallback for an empty one — and pinned to
+# the shipped file by tests, exactly as THEME_FIELD_ORDER is.
+PAGE_FIELD_ORDER: tuple[str, ...] = ("id", "title", "type", "grid", "buttons")
+
+PAGE_TEMPLATE: dict[str, Any] = {
+    "id": "page",
+    "title": "Page",
+    "type": "grid",
+    "grid": {"cols": 4, "rows": 3},
+    "buttons": [],
+}
+
+BUTTON_FIELD_ORDER: tuple[str, ...] = (
+    "id", "label", "icon", "display", "pos", "action", "hold",
+)
+
+# `icon` and `display` are "" rather than null, following the file: both are read as strings by
+# the firmware and "" is what it already treats as unset.
+BUTTON_TEMPLATE: dict[str, Any] = {
+    "id": "button",
+    "label": "Button",
+    "icon": "",
+    "display": "",
+    "pos": None,
+    "action": {"type": "launch", "target": ""},
+    "hold": None,
+}
+
+# `pos` is null or all four, never some of them. The firmware reads each field independently and
+# defaults the missing ones, so a partial pos is legal and does something — which is precisely why
+# writing one is a bad idea: `{"col": 2}` means row -1, meaning auto-flow, meaning `col` is
+# ignored. Keeping it all-or-nothing keeps it readable.
+POS_FIELD_ORDER: tuple[str, ...] = ("col", "row", "w", "h")
+
+# Page types whose contents the firmware draws itself. A grid on one of these is not read, and
+# buttons on one are parsed and then never built — both look like an edit that did not take.
+FIRMWARE_PAGE_TYPES = frozenset({"numpad", "stats", "calendar", "colortest"})
+
+
 class ModelError(Exception):
     pass
 
@@ -95,6 +135,8 @@ class DeckDoc:
     settings: dict[str, Any]
     pages: list[dict[str, Any]]
     field_order: tuple[str, ...]
+    page_order: tuple[str, ...] = PAGE_FIELD_ORDER
+    button_order: tuple[str, ...] = BUTTON_FIELD_ORDER
     _undo: list[State] = field(default_factory=list)
     _redo: list[State] = field(default_factory=list)
 
@@ -119,6 +161,8 @@ class DeckDoc:
             settings=settings,
             pages=pages,
             field_order=cls._field_order(themes),
+            page_order=cls._order_of(pages[0] if pages else None, PAGE_FIELD_ORDER),
+            button_order=cls._order_of(cls._first_button(pages), BUTTON_FIELD_ORDER),
         )
 
     @staticmethod
@@ -132,6 +176,24 @@ class DeckDoc:
         if themes and isinstance(themes[0], dict) and themes[0]:
             return tuple(themes[0])
         return THEME_FIELD_ORDER
+
+    @staticmethod
+    def _order_of(sample: Any, fallback: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(sample) if isinstance(sample, dict) and sample else fallback
+
+    @staticmethod
+    def _first_button(pages: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """The first button anywhere in the file, not the first button of the first page.
+
+        The shipped deck opens on a grid, but a deck whose first page is the ten-key has no
+        buttons at all on `pages[0]` — and taking the shape from an empty list would silently
+        fall back to the literal for a file that had a perfectly good answer three pages down.
+        """
+        for page in pages:
+            for button in page.get("buttons") or []:
+                if isinstance(button, dict) and button:
+                    return button
+        return None
 
     # -- editing -------------------------------------------------------------------------
 
@@ -287,19 +349,125 @@ class DeckDoc:
         return [t.get("name") or f"Theme {i + 1}" for i, t in enumerate(self.themes)]
 
     def shape_problems(self) -> list[str]:
-        """Themes whose keys have drifted from the canonical order.
+        """Anything whose keys have drifted from this file's canonical order.
 
-        The writer refuses to emit these, so this exists to say why the save button is off
-        rather than to let it through.
+        The writer used to catch drifted themes structurally — it regenerated each block and
+        compared it to the file, so a theme with a missing key could not be spliced. A dump has
+        no such failure mode: it will write whatever it is handed. So the guard is explicit now,
+        and it is what turns the save button off.
         """
         problems = []
+
         for index, theme in enumerate(self.themes):
             if tuple(theme) != self.field_order:
                 name = theme.get("name") or f"themes[{index}]"
                 problems.append(
                     f"theme {name}: keys are not the canonical set in canonical order"
                 )
+
+        for index, page in enumerate(self.pages):
+            where = page.get("id") or f"pages[{index}]"
+            if not isinstance(page, dict) or tuple(page) != self.page_order:
+                problems.append(
+                    f"page {where}: keys are not the canonical set in canonical order "
+                    f"({', '.join(self.page_order)})"
+                )
+                continue
+
+            problems.extend(self._page_content_problems(page, where))
+
         return problems
+
+    def _page_content_problems(self, page: dict[str, Any], where: str) -> list[str]:
+        problems: list[str] = []
+
+        # A firmware page draws its own contents. A grid or a button on one is not an error the
+        # device reports — it is parsed, ignored, and paid for in wire bytes forever.
+        if page.get("type") in FIRMWARE_PAGE_TYPES:
+            if page.get("grid") is not None:
+                problems.append(
+                    f"page {where}: type is {page.get('type')!r}, which draws its own layout — "
+                    "grid should be null"
+                )
+            if page.get("buttons"):
+                problems.append(
+                    f"page {where}: type is {page.get('type')!r}, so its buttons are never "
+                    "built. Move them to a grid page or delete them"
+                )
+
+        for index, button in enumerate(page.get("buttons") or []):
+            button_where = (button.get("id") if isinstance(button, dict) else None) \
+                or f"{where}.buttons[{index}]"
+            if not isinstance(button, dict) or tuple(button) != self.button_order:
+                problems.append(
+                    f"button {button_where}: keys are not the canonical set in canonical "
+                    f"order ({', '.join(self.button_order)})"
+                )
+                continue
+
+            pos = button.get("pos")
+            if pos is None:
+                continue
+            if not isinstance(pos, dict) or tuple(pos) != POS_FIELD_ORDER:
+                problems.append(
+                    f"button {button_where}: pos must be null or exactly "
+                    f"{{{', '.join(POS_FIELD_ORDER)}}}, in that order"
+                )
+                continue
+            for key, value in pos.items():
+                if isinstance(value, bool) or not isinstance(value, int):
+                    problems.append(
+                        f"button {button_where}: pos.{key} is {value!r}, expected a whole number"
+                    )
+
+        return problems
+
+    def notices(self) -> list[str]:
+        """Worth saying, but not worth refusing a save over.
+
+        The drift check is the mitigation for a real hole in shape_problems(): it compares every
+        item against the order *derived from this file*, so if the file's own first button has
+        grown a key, the editor adopts that shape and every check passes. Deriving is the right
+        default — add a token to the firmware's parser, write it into one button, and the editor
+        follows with no change here — but it should not be silent, because the other way to
+        arrive at a drifted first item is a bad hand edit.
+
+        Making it a problem instead would invert the trade: a new firmware field would render the
+        file unsavable until this module was updated, which is exactly the coupling the
+        derivation exists to remove.
+        """
+        notices: list[str] = []
+
+        for label, derived, literal in (
+            ("theme", self.field_order, THEME_FIELD_ORDER),
+            ("page", self.page_order, PAGE_FIELD_ORDER),
+            ("button", self.button_order, BUTTON_FIELD_ORDER),
+        ):
+            if derived == literal:
+                continue
+            extra = [k for k in derived if k not in literal]
+            missing = [k for k in literal if k not in derived]
+            detail = ", ".join(
+                filter(None, [
+                    f"extra: {', '.join(extra)}" if extra else "",
+                    f"missing: {', '.join(missing)}" if missing else "",
+                    "reordered" if not extra and not missing else "",
+                ])
+            )
+            notices.append(
+                f"this file's {label} shape differs from the one this editor was built "
+                f"against ({detail}); new {label}s will copy the file's"
+            )
+
+        try:
+            candidate = DeckConfig.from_raw(
+                self.candidate_raw(), path=self.path, validate=False
+            )
+            notices.extend(candidate.warnings())
+        except Exception:  # already reported by problems()
+            pass
+
+        return notices
 
     def mark_saved(self, text: str, rev: int) -> None:
         """Adopts what was just written as the new baseline."""

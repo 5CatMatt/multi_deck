@@ -410,6 +410,21 @@ def clear_asset_cache() -> None:
 # -- pages -------------------------------------------------------------------------------
 
 
+def grid_size(grid: dict | None) -> tuple[int, int]:
+    """The columns and rows the firmware would use — ui_builder.cpp:398-399.
+
+    `page.cols > 0 ? page.cols : 4`, which is not the same as "falsy means default": a grid
+    written as `{"cols": -2}` falls back on the device and used to divide by -2 here, producing
+    a preview of a layout that does not exist.
+    """
+    grid = grid or {}
+    cols, rows = grid.get("cols"), grid.get("rows")
+    return (
+        cols if isinstance(cols, int) and not isinstance(cols, bool) and cols > 0 else 4,
+        rows if isinstance(rows, int) and not isinstance(rows, bool) and rows > 0 else 3,
+    )
+
+
 def _cells(cols: int, rows: int) -> tuple[int, int]:
     """C integer division, deliberately — ui_builder.cpp:400-401.
 
@@ -423,6 +438,19 @@ def _cells(cols: int, rows: int) -> tuple[int, int]:
     )
 
 
+def _int_or(value: Any, fallback: int) -> int:
+    """ArduinoJson's `variant | default`, which is how every pos field is read.
+
+    deck_config.cpp:287 is `pos["col"] | -1`, and that yields -1 for a *null* variant exactly as
+    it does for an absent key. So `{"col": null, "row": null, "w": 2, "h": 1}` is legal on the
+    device and means "auto-flow, but span two columns" — a shape the editor is about to start
+    writing, and one that used to reach `None < 0` here and take the preview down.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return fallback
+    return value
+
+
 def _tile_box(col: int, row: int, w: int, h: int, cell_w: int, cell_h: int) -> tuple:
     x = PAD + col * (cell_w + PAD)
     y = NAV_H + PAD + row * (cell_h + PAD)
@@ -433,22 +461,36 @@ def _draw_grid_page(
     base: Image.Image, page: dict, theme: dict, settings: dict, *, link_up: bool,
     state: str, asset_root: Path | None, warnings: list[str],
 ) -> None:
-    grid = page.get("grid") or {}
-    cols = grid.get("cols") or 4
-    rows = grid.get("rows") or 3
+    cols, rows = grid_size(page.get("grid"))
     cell_w, cell_h = _cells(cols, rows)
     radius = radius_of(theme)
 
     flow = 0
     for index, button in enumerate(page.get("buttons") or []):
         pos = button.get("pos") or {}
-        col, row = pos.get("col", -1), pos.get("row", -1)
+        col, row = _int_or(pos.get("col"), -1), _int_or(pos.get("row"), -1)
+        w, h = _int_or(pos.get("w"), 1), _int_or(pos.get("h"), 1)
+
         if col < 0 or row < 0:
+            # ui_builder.cpp:409 — flow++ fires only in this branch, so a pinned tile consumes
+            # no slot and every auto tile after it shifts.
             col, row = flow % cols, flow // cols
             flow += 1
+
         if row >= rows:
             warnings.append(f"{button.get('id')}: falls outside the {cols}x{rows} grid")
             continue
+        if col + w > cols:
+            # The device logs nothing for this at all. The tile is created at its computed x and
+            # simply extends past the 800px edge, so from the deck it reads as a tile that is
+            # not there — hence saying it here, where it can still be fixed.
+            warnings.append(
+                f"{button.get('id')}: starts at column {col} and spans {w}, "
+                f"past the {cols}-column grid"
+            )
+        if w < 1 or h < 1:
+            warnings.append(f"{button.get('id')}: pos w/h is {w}x{h}, drawn as 1x1")
+            w, h = max(1, w), max(1, h)
 
         # ui_builder.cpp:421 — a tile whose action the agent has to run is dead without it.
         enabled = is_device_local(button.get("action") or {}) or link_up
@@ -457,7 +499,7 @@ def _draw_grid_page(
             tile_state = "disabled"
 
         fill_opa, border_opa, accent = _tile_state(theme, tile_state)
-        box = _tile_box(col, row, pos.get("w", 1) or 1, pos.get("h", 1) or 1, cell_w, cell_h)
+        box = _tile_box(col, row, w, h, cell_w, cell_h)
         draw_card(
             base, box, theme,
             fill_opa=fill_opa, radius=radius, border_opa=border_opa,
@@ -515,7 +557,8 @@ def _draw_panel_page(base: Image.Image, page: dict, theme: dict) -> None:
 
 
 def _draw_nav(
-    base: Image.Image, raw: dict, theme: dict, active_page_id: str, link_up: bool
+    base: Image.Image, raw: dict, theme: dict, active_page_id: str, link_up: bool,
+    warnings: list[str],
 ) -> None:
     # theme.cpp:207-212 — the bar only carries a scrim when there is a wallpaper behind it.
     if theme.get("wallpaper"):
@@ -525,8 +568,17 @@ def _draw_nav(
     radius = min(radius_of(theme), TAB_MAX_RADIUS)
     for index, page in enumerate(raw.get("pages") or []):
         x = PAD + index * TAB_STEP
+
+        # The firmware does not stop here (ui_builder.cpp:516-534): it creates every tab and
+        # lets the non-scrollable nav container clip whatever runs past 800px. This used to
+        # break instead, which made the preview clean at exactly the point the deck stops
+        # being usable — the one case where it most needed to show you the problem.
         if x + TAB_W > SCREEN_W:
-            break
+            warnings.append(
+                f"page {page.get('id')!r}: the nav bar fits {(SCREEN_W - PAD) // TAB_STEP} "
+                "tabs, and this one is cut off at the edge with no way to reach it"
+            )
+
         active = page.get("id") == active_page_id
         draw_card(
             base, (x, PAD, x + TAB_W, PAD + TAB_H), theme,
@@ -586,6 +638,6 @@ def render_page(
     else:
         _draw_panel_page(base, page, theme)
 
-    _draw_nav(base, raw, theme, page.get("id"), link_up)
+    _draw_nav(base, raw, theme, page.get("id"), link_up, warnings)
 
     return Preview(image=base, warnings=warnings, font_name=face_description())
