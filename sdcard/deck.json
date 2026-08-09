@@ -1,14 +1,19 @@
 {
-  "rev": 14,
+  "rev": 15,
   "themes": [
     {
       "name": "Midnight",
+      "display": "",
+      "wallpaper": "",
       "bg": "#0d1117",
       "tile": "#1b2129",
       "tile_grad": "#141a21",
+      "tile_opa": 100,
       "border": "#8fa6c0",
       "border_opa": 22,
       "radius": 14,
+      "dim_opa": null,
+      "flip180": null,
       "accent": "#4aa3ff",
       "text": "#e6edf3",
       "text_muted": "#8b949e",
@@ -17,6 +22,7 @@
     },
     {
       "name": "Stars",
+      "display": "",
       "wallpaper": "/wall/stars.bin",
       "bg": "#060a12",
       "tile": "#0a1424",
@@ -25,6 +31,8 @@
       "border": "#9fd8ff",
       "border_opa": 26,
       "radius": 16,
+      "dim_opa": null,
+      "flip180": null,
       "accent": "#4fd6ff",
       "text": "#ffffff",
       "text_muted": "#a8c4d8",
@@ -33,6 +41,7 @@
     },
     {
       "name": "Wavy",
+      "display": "",
       "wallpaper": "/wall/wavy.bin",
       "bg": "#050a1c",
       "tile": "#08102a",
@@ -41,6 +50,8 @@
       "border": "#cfe0ff",
       "border_opa": 22,
       "radius": 16,
+      "dim_opa": null,
+      "flip180": null,
       "accent": "#7aa8ff",
       "text": "#ffffff",
       "text_muted": "#b3c2e0",
@@ -49,6 +60,7 @@
     },
     {
       "name": "Verdant",
+      "display": "",
       "wallpaper": "/wall/verdant.bin",
       "bg": "#0b1207",
       "tile": "#0d1608",
@@ -57,6 +69,8 @@
       "border": "#e8ffc9",
       "border_opa": 24,
       "radius": 16,
+      "dim_opa": null,
+      "flip180": null,
       "accent": "#ffc247",
       "text": "#ffffff",
       "text_muted": "#b9cba4",
@@ -66,12 +80,16 @@
     {
       "name": "Paper",
       "display": "text",
+      "wallpaper": "",
       "bg": "#e8e4dc",
       "tile": "#ffffff",
       "tile_grad": "#f2efe9",
+      "tile_opa": 100,
       "border": "#5a5a52",
       "border_opa": 30,
       "radius": 12,
+      "dim_opa": null,
+      "flip180": null,
       "accent": "#2f6f4f",
       "text": "#22201c",
       "text_muted": "#6b675e",
@@ -81,12 +99,16 @@
     {
       "name": "Green",
       "display": "icon",
+      "wallpaper": "",
       "bg": "#0d0f0e",
       "tile": "#5f8b8c",
       "tile_grad": "#5f8b8c",
+      "tile_opa": 100,
       "border": "#5a5a52",
       "border_opa": 0,
       "radius": 12,
+      "dim_opa": null,
+      "flip180": null,
       "accent": "#263838",
       "text": "#f1efea",
       "text_muted": "#6b675e",
@@ -99,6 +121,7 @@
     "idle_dim_s": 120,
     "idle_off_s": 600,
     "sleep_clock_s": 20,
+    "dim_pct": 15,
     "theme": "Stars",
     "display": "icon_text"
   },
@@ -115,50 +138,69 @@
         {
           "id": "launch.vscode",
           "label": "VS Code",
+          "icon": "",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "launch",
             "target": "code"
-          }
+          },
+          "hold": null
         },
         {
           "id": "launch.explorer",
           "label": "Explorer",
           "icon": "directory",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "launch",
             "target": "explorer.exe"
-          }
+          },
+          "hold": null
         },
         {
           "id": "launch.terminal",
           "label": "Terminal",
           "icon": "keyboard",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "launch",
             "target": "wt.exe"
-          }
+          },
+          "hold": null
         },
         {
           "id": "launch.browser",
           "label": "Browser",
+          "icon": "",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "launch",
             "target": "https://github.com"
-          }
+          },
+          "hold": null
         },
         {
           "id": "macro.email",
           "label": "Email",
           "icon": "envelope",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid_text",
             "text": "you@example.com"
-          }
+          },
+          "hold": null
         },
         {
           "id": "macro.print",
           "label": "Print",
           "icon": "download",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "seq",
             "steps": [
@@ -178,41 +220,54 @@
                 ]
               }
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "win.snap_left",
           "label": "Snap L",
           "icon": "left",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "ahk",
             "fn": "SnapLeft"
-          }
+          },
+          "hold": null
         },
         {
           "id": "win.snap_right",
           "label": "Snap R",
           "icon": "right",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "ahk",
             "fn": "SnapRight"
-          }
+          },
+          "hold": null
         },
         {
           "id": "sys.lock",
           "label": "Lock",
+          "icon": "",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
               "GUI",
               "l"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "sys.taskmgr",
           "label": "Task Mgr",
           "icon": "list",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
@@ -220,28 +275,35 @@
               "SHIFT",
               "ESC"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "sys.desktop",
           "label": "Desktop",
           "icon": "home",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
               "GUI",
               "d"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "nav.macros",
           "label": "Macros",
           "icon": "right",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "page",
             "target": "macros"
-          }
+          },
+          "hold": null
         }
       ]
     },
@@ -254,10 +316,12 @@
         "rows": 3
       },
       "buttons": [
-          {
+        {
           "id": "ui.theme",
           "label": "Theme >",
           "icon": "tint",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "theme",
             "target": "next"
@@ -271,58 +335,74 @@
           "id": "media.mute",
           "label": "Mute",
           "icon": "mute",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "media",
             "key": "mute"
-          }
+          },
+          "hold": null
         },
         {
           "id": "edit.undo",
           "label": "Undo",
           "icon": "refresh",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
               "CTRL",
               "z"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "edit.redo",
           "label": "Redo",
           "icon": "ok",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
               "CTRL",
               "y"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "launch.notepad",
           "label": "Notepad",
           "icon": "file",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "launch",
             "target": "notepad.exe"
-          }
+          },
+          "hold": null
         },
         {
           "id": "launch.calc",
           "label": "Calc",
           "icon": "plus",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "launch",
             "target": "calc.exe"
-          }
+          },
+          "hold": null
         },
-        
         {
           "id": "sys.screenshot",
           "label": "Snip",
           "icon": "image",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
@@ -330,84 +410,106 @@
               "SHIFT",
               "s"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "macro.paint",
           "label": "Paint",
           "icon": "image",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "seq",
             "steps": [
               { "type": "launch", "target": "mspaint.exe" },
               { "type": "ahk", "fn": "PasteInto", "args": ["ahk_exe mspaint.exe", "^+x"] }
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "edit.save",
           "label": "Save",
           "icon": "save",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
               "CTRL",
               "s"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "edit.cut",
           "label": "Cut",
           "icon": "cut",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
               "CTRL",
               "x"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "edit.copy",
           "label": "Copy",
           "icon": "copy",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
               "CTRL",
               "c"
             ]
-          }
+          },
+          "hold": null
         },
         {
           "id": "edit.paste",
           "label": "Paste",
           "icon": "paste",
+          "display": "",
+          "pos": null,
           "action": {
             "type": "hid",
             "keys": [
               "CTRL",
               "v"
             ]
-          }
+          },
+          "hold": null
         }
       ]
     },
     {
       "id": "numpad",
       "title": "Ten-Key",
-      "type": "numpad"
+      "type": "numpad",
+      "grid": null,
+      "buttons": []
     },
     {
       "id": "stats",
       "title": "System",
-      "type": "stats"
+      "type": "stats",
+      "grid": null,
+      "buttons": []
     },
     {
       "id": "calendar",
       "title": "Calendar",
-      "type": "calendar"
+      "type": "calendar",
+      "grid": null,
+      "buttons": []
     }
   ]
 }

@@ -41,6 +41,31 @@ COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
 THEME_DISPLAY_VALUES = frozenset({"icon_text", "icon", "text"})
 
+# Numeric theme fields. The firmware clamps these rather than ignoring them, so only a wrong
+# *type* is worth flagging — `"radius": 200` is defined behaviour, `"radius": "16"` is a typo.
+THEME_NUMERIC_FIELDS = ("tile_opa", "border_opa", "radius", "dim_opa")
+
+# ---------------------------------------------------------------------------
+# Writing the default down
+# ---------------------------------------------------------------------------
+#
+# Every theme field is optional, and for a while the *only* way to say "use the default" was to
+# leave the key out. That made objects of the same kind different shapes — two themes side by
+# side, one with `display` and one without — and gave the silent one nothing to read. Worse, the
+# obvious guess at writing it down was rejected here, so the format punished the person trying
+# to be consistent.
+#
+# So every field now has a written form of "unset": `null` for numbers, booleans and colours,
+# `""` for the two string fields. The firmware needed no changes to accept them — `parseColor`
+# returns false for a null variant, `parsePercent` fails `is<int>()`, and ArduinoJson's `|`
+# yields the fallback — which is the same path an absent key already took.
+#
+# This matters most for the fields whose default comes from config.h rather than from the
+# format: `dim_opa` is 0 with the PWM backlight rewire and 55 without it, and `flip180` follows
+# MD_ROTATE_180. Writing a literal into deck.json overrides the build. `null` lets a theme carry
+# the key without taking that decision away from config.h.
+DISPLAY_UNSET = ("", None)
+
 # Page types the firmware knows, mirroring the strcmp chain in DeckConfig::parse().
 #
 # Worth validating because the firmware's fallback for an unrecognised type is `grid` — and a
@@ -86,6 +111,23 @@ def is_device_local(action: dict[str, Any]) -> bool:
         return all(is_device_local(step) for step in action.get("steps", []))
 
     return False
+
+
+def check_display(value: Any, subject: str, problems: list[str]) -> None:
+    """One rule for `display`, shared by all three levels it can appear at.
+
+    `subject` names the field the way the reader wrote it — "settings.display",
+    "theme Kiosk: display", "edit.paste_plain: display" — so the message points at a line rather
+    than at a level of the format.
+    """
+    if value in DISPLAY_UNSET:
+        return
+
+    if value not in THEME_DISPLAY_VALUES:
+        problems.append(
+            f"{subject} is {value!r}, expected one of "
+            f'{", ".join(sorted(THEME_DISPLAY_VALUES))} — or "" to take the level above'
+        )
 
 
 def default_deck_path() -> Path:
@@ -188,12 +230,9 @@ class DeckConfig:
                 )
 
         settings = self.raw.get("settings") or {}
-        display = settings.get("display")
-        if display is not None and display not in THEME_DISPLAY_VALUES:
-            problems.append(
-                f"settings.display is {display!r}, expected one of "
-                f"{', '.join(sorted(THEME_DISPLAY_VALUES))}"
-            )
+        # An empty baseline is legal but pointless: the chain has nowhere left to fall through
+        # to, so the firmware's own default (`icon_text`) is what a tile ends up with.
+        check_display(settings.get("display"), "settings.display", problems)
 
         start_theme = settings.get("theme")
         if start_theme and start_theme not in theme_names:
@@ -256,28 +295,33 @@ class DeckConfig:
             where = theme.get("name") or f"themes[{index}]"
 
             for field_name in THEME_COLOR_FIELDS:
-                if field_name not in theme:
+                value = theme.get(field_name)
+                if value is None:
                     continue
-                value = theme[field_name]
                 if not isinstance(value, str) or not COLOR_RE.match(value):
                     problems.append(
                         f"theme {where}: {field_name} is {value!r}, "
-                        "expected six hex digits like '#1b2129'"
+                        "expected six hex digits like '#1b2129' — or null for the default"
                     )
 
-            for field_name in ("tile_opa", "border_opa", "radius"):
-                if field_name in theme and not isinstance(theme[field_name], int):
+            for field_name in THEME_NUMERIC_FIELDS:
+                value = theme.get(field_name)
+                if value is None:
+                    continue
+                # bool is an int subclass, and `"radius": true` is a mistake worth naming.
+                if isinstance(value, bool) or not isinstance(value, int):
                     problems.append(
-                        f"theme {where}: {field_name} is {theme[field_name]!r}, "
-                        "expected a whole number"
+                        f"theme {where}: {field_name} is {value!r}, "
+                        "expected a whole number — or null for the default"
                     )
 
-            display = theme.get("display")
-            if display is not None and display not in THEME_DISPLAY_VALUES:
+            flip = theme.get("flip180")
+            if flip is not None and not isinstance(flip, bool):
                 problems.append(
-                    f"theme {where}: display is {display!r}, expected one of "
-                    f"{', '.join(sorted(THEME_DISPLAY_VALUES))}"
+                    f"theme {where}: flip180 is {flip!r}, expected true, false or null"
                 )
+
+            check_display(theme.get("display"), f"theme {where}: display", problems)
 
     def _validate_button(
         self, button: dict[str, Any], button_id: str, problems: list[str]
@@ -287,12 +331,7 @@ class DeckConfig:
         Both of these degrade to "show the label" when the firmware cannot make sense of them,
         so a typo costs you the icon and tells you nothing.
         """
-        display = button.get("display")
-        if display is not None and display not in THEME_DISPLAY_VALUES:
-            problems.append(
-                f"{button_id}: display is {display!r}, expected one of "
-                f"{', '.join(sorted(THEME_DISPLAY_VALUES))}"
-            )
+        check_display(button.get("display"), f"{button_id}: display", problems)
 
         icon = button.get("icon")
         if not icon:

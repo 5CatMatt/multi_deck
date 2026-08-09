@@ -73,6 +73,7 @@ to show something specific before the agent ever connects.
 "themes": [
   {
     "name":       "Midnight",   // how you refer to it; shown as a toast when it is selected
+    "display":    "",           // tile anatomy for this theme; "" inherits — see Tile anatomy
     "wallpaper":  "",           // path to an image on the SD card, e.g. "/wall/dusk.bin"
 
     "bg":         "#0d1117",    // the backdrop, behind everything
@@ -89,9 +90,9 @@ to show something specific before the agent ever connects.
     "ok":         "#3fb950",    // status dot, agent connected
     "idle":       "#6e7681",    // status dot, agent absent
 
-    "dim_opa":    55,           // how dark the idle veil goes, 0-100
+    "dim_opa":    null,         // how dark the idle veil goes, 0-100; null follows the build
 
-    "flip180":    true          // mount the deck the other way up
+    "flip180":    null          // true mounts the deck the other way up; null follows the build
   }
 ],
 "settings": {
@@ -104,9 +105,25 @@ to show something specific before the agent ever connects.
 }
 ```
 
-**Every field is optional.** An absent one keeps its default rather than being coerced — including
-`"bg": "#000000"`, which is a real black and not a parse failure. Colours are six-digit hex, `#`
-optional; anything else is rejected and the default kept.
+**Every field is optional, and every default can be written down.** `null` means "use the
+built-in default" for numbers, booleans and colours; `""` means it for `display` and `wallpaper`.
+So a theme that wants the stock radius says `"radius": null` rather than dropping the line, and
+themes stay the same shape as each other — which is the point of a config file. An absent key
+still works and means the same thing; it just tells the next reader nothing.
+
+The shipped `sdcard/deck.json` carries every key in every theme, and `tools/protocol_test.py`
+holds it to that by reading the field list out of the firmware's own `parseTheme()`.
+
+**Two fields default from `config.h` rather than from the format, and the shipped themes leave
+them `null` on purpose.** `dim_opa` is `0` with the PWM backlight rewire and `55` without it,
+because the veil only exists to supply darkness the backlight cannot — and `flip180` follows
+`MD_ROTATE_180`. A literal in `deck.json` overrides the build, so writing this deck's `0` into
+the file would leave an unmodified board with an idle state that does nothing visible at all.
+`null` keeps the key present and the decision where it belongs. Set a real number on a theme
+that genuinely wants one — a pale theme needs a heavier veil than a dark one.
+
+Colours are six-digit hex, `#` optional — including `"bg": "#000000"`, which is a real black and
+not a parse failure. Anything else is rejected and the default kept.
 
 #### The two idle timers are not the same idea
 
@@ -243,6 +260,7 @@ stamp. 64 px suits `icon_text`; 96 px suits `icon`, which has the whole tile to 
 ```jsonc
 "settings": { "display": "icon_text" }                    // the deck-wide default
 { "name": "Kiosk", "display": "icon" }                    // this theme only, optional
+{ "name": "Stars", "display": "" }                        // inherit, said out loud
 { "id": "edit.paste_plain", "display": "text" }           // this tile only, optional
 ```
 
@@ -262,6 +280,15 @@ The modes:
 | `icon_text` | icon above the label — the general-purpose choice |
 | `icon` | icon only, larger. Good for a transport row where the symbol is unambiguous |
 | `text` | label only, larger. The behaviour before icons existed |
+| `""` | nothing of its own — take the level above. Identical to leaving the key out |
+
+That last row is a repair, not a curiosity. Deleting the line used to be the *only* way to say
+"default", which meant two themes in the same file were different shapes and the silent one gave
+you nothing to read. `"display": ""` says it out loud, so every theme can carry the same keys —
+and it validates, which the empty form previously did not. On `settings` it is legal but inert:
+there is no level above, so tiles land on the firmware's own `icon_text`.
+
+`"wallpaper": ""` works the same way, and everything numeric takes `null`.
 
 Anything that cannot produce an icon — no `icon` field, an unknown name, a missing image —
 falls back to `text` on that tile alone. So a deck part-way through being iconned looks
@@ -376,9 +403,16 @@ The agent checks the file before pushing and rejects it on:
 - a `page` action pointing at a page that does not exist
 - a `theme` action naming a theme that does not exist
 - `settings.theme` naming a theme that does not exist
+- a colour, number, `display` or `flip180` of the wrong *type* — six hex digits, a whole number,
+  one of the three modes, a boolean
 
-The last three are the valuable checks. Without them a typo'd target produces a button that looks
-perfectly normal and silently does nothing.
+The middle three are the valuable checks. Without them a typo'd target produces a button that
+looks perfectly normal and silently does nothing.
+
+The type checks all accept the written form of unset: `null` for numbers, booleans and colours,
+`""` for `display`, `icon` and `wallpaper`. That is what lets every object in the file carry the
+same keys — see **Themes** above. `tools/protocol_test.py` holds the shipped file to it, reading
+the field lists out of the firmware's own parser so a new field cannot be added on one side only.
 
 Validate without touching the deck:
 

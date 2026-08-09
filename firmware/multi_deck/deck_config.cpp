@@ -55,8 +55,14 @@ bool parsePercent(JsonVariantConst value, uint8_t &out) {
   return true;
 }
 
+// A missing key and an empty string are the same answer: take the level above.
+//
+// The empty string is the *writable* form of that, and it is spelled out here rather than left
+// to the fallback at the bottom so it survives someone tightening this function later. Without
+// it, the only way to say "default" was to delete the line — which is why deck.json ended up
+// with themes of two different shapes and no way to see, in the file, what a silent one does.
 TileDisplay tileDisplayFromString(const char *s, TileDisplay fallback) {
-  if (s == nullptr) return fallback;
+  if (s == nullptr || *s == '\0') return fallback;
   if (strcmp(s, "icon_text") == 0) return TileDisplay::IconText;
   if (strcmp(s, "icon") == 0) return TileDisplay::Icon;
   if (strcmp(s, "text") == 0) return TileDisplay::Text;

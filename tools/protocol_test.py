@@ -282,6 +282,15 @@ class ThemeParsingTests(unittest.TestCase):
                 self._load(Path(tmp), {"themes": [{"name": "T", "display": "icons"}]})
             self.assertIn("display", str(ctx.exception))
 
+    def test_empty_display_is_the_written_form_of_unset(self):
+        # So every theme can carry the same keys. Deleting the line was once the only way to
+        # get the default, which left themes in a file looking like different kinds of object.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._load(Path(tmp), {"themes": [{"name": "T", "display": ""}]})
+            self.assertEqual(config.theme_names(), ["T"])
+
     def test_start_theme_must_exist(self):
         import tempfile
 
@@ -729,6 +738,199 @@ class IconNameTests(unittest.TestCase):
                 self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
 
 
+class ConfigShapeTests(unittest.TestCase):
+    """deck.json is a socket: objects of the same kind present the same keys.
+
+    Optional-means-absent let that drift. Themes ended up in two shapes — some with `display`,
+    some without, some with `tile_opa` — and an absent key told the reader nothing about whether
+    the default was chosen or forgotten. Every field has a written form of unset now (`null`, or
+    `""` for strings), so a gap is a gap rather than a statement.
+
+    These tests read the firmware's own parser for the field list, which is what stops the file
+    going stale: add `src["glow"]` to parseTheme and every theme here has to answer for it.
+    """
+
+    @staticmethod
+    def _deck() -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _source() -> str:
+        return (REPO / "firmware" / "multi_deck" / "deck_config.cpp").read_text(encoding="utf-8")
+
+    def _theme_fields(self) -> set[str]:
+        body = re.search(r"Theme parseTheme\(JsonObjectConst src\) \{(.*?)\n\}", self._source(), re.S)
+        self.assertIsNotNone(body, "could not find parseTheme() in deck_config.cpp")
+        return set(re.findall(r'src\["(\w+)"\]', body.group(1)))
+
+    def _settings_fields(self) -> set[str]:
+        # Scoped to the settings block: `s` is a short name, and `pos["col"]` a few lines
+        # further down matches a bare `s\["..."\]` just as well.
+        block = re.search(
+            r'JsonObjectConst s = root\["settings"\];(.*?)active_theme_', self._source(), re.S
+        )
+        self.assertIsNotNone(block, "could not find the settings block in deck_config.cpp")
+        return set(re.findall(r's\["(\w+)"\]', block.group(1)))
+
+    def test_every_theme_carries_every_field_the_firmware_reads(self):
+        fields = self._theme_fields()
+        self.assertIn("tile_opa", fields, "parsed no theme fields out of deck_config.cpp")
+
+        for theme in self._deck()["themes"]:
+            with self.subTest(theme=theme.get("name")):
+                self.assertEqual(
+                    set(theme),
+                    fields,
+                    "theme keys and parseTheme() have drifted — write the missing key with "
+                    "null (or \"\") rather than leaving it out",
+                )
+
+    def test_themes_agree_on_key_order(self):
+        """Same keys in the same order, so two themes diff against each other cleanly."""
+        shapes = {t["name"]: tuple(t) for t in self._deck()["themes"]}
+        reference = shapes["Midnight"]
+        for name, shape in shapes.items():
+            with self.subTest(theme=name):
+                self.assertEqual(shape, reference)
+
+    def test_settings_carries_every_field_the_firmware_reads(self):
+        fields = self._settings_fields()
+        self.assertIn("dim_pct", fields, "parsed no settings fields out of deck_config.cpp")
+        self.assertEqual(set(self._deck()["settings"]), fields)
+
+    def test_every_page_carries_every_field_the_firmware_reads(self):
+        # To the end of the loop body, so `p["buttons"]` — which the inner loop iterates — is
+        # inside the slice rather than the line that terminates it.
+        block = re.search(
+            r'for \(JsonObjectConst p : root\["pages"\](.*?)\n    pages\.push_back',
+            self._source(),
+            re.S,
+        )
+        self.assertIsNotNone(block, "could not find the page loop in deck_config.cpp")
+        fields = set(re.findall(r'p\["(\w+)"\]', block.group(1)))
+        self.assertIn("buttons", fields, "parsed no page fields out of deck_config.cpp")
+
+        for page in self._deck()["pages"]:
+            with self.subTest(page=page["id"]):
+                self.assertEqual(set(page), fields)
+
+    def test_every_button_carries_every_field_the_firmware_reads(self):
+        block = re.search(
+            r'for \(JsonObjectConst b : p\["buttons"\](.*?)\n      page\.buttons\.push_back',
+            self._source(),
+            re.S,
+        )
+        self.assertIsNotNone(block, "could not find the button loop in deck_config.cpp")
+        fields = set(re.findall(r'b\["(\w+)"\]', block.group(1)))
+        self.assertIn("hold", fields, "parsed no button fields out of deck_config.cpp")
+
+        buttons = [b for page in self._deck()["pages"] for b in page["buttons"]]
+        self.assertTrue(buttons, "the shipped deck has no buttons to check")
+        for button in buttons:
+            with self.subTest(button=button["id"]):
+                self.assertEqual(set(button), fields)
+
+    def test_buttons_agree_on_key_order(self):
+        shapes = {
+            b["id"]: tuple(b) for page in self._deck()["pages"] for b in page["buttons"]
+        }
+        reference = shapes["launch.vscode"]
+        for button_id, shape in shapes.items():
+            with self.subTest(button=button_id):
+                self.assertEqual(shape, reference)
+
+    def test_the_shipped_layout_still_fits_in_one_line(self):
+        """Writing every default down costs bytes, and the line limit is a cliff.
+
+        `layout` crosses as a single line, and the firmware drops any line at or over
+        MD_LINK_RX_MAX (8192) with "[link] oversized line — resynchronising". Nothing checks
+        this on the way out — MAX_LINE_BYTES guards the *inbound* reader only — so the failure
+        is a tray reload that appears to do nothing while the deck keeps its cached SD copy.
+
+        Filling in the shape took the frame from ~4.5KB to ~5.8KB. That is fine and this test
+        says so out loud, because the next few pages are what would take it over.
+        """
+        from deckhost import protocol
+
+        config = DeckConfig.load(REPO / "sdcard" / "deck.json")
+        line = protocol.encode(protocol.layout(config.rev, config.raw))
+
+        self.assertLess(
+            len(line),
+            protocol.MAX_LINE_BYTES,
+            "the layout frame no longer fits in one line — the device would drop it",
+        )
+        # Margin, not just the limit: a deck this size should not be near the cliff at all.
+        self.assertLess(
+            len(line),
+            protocol.MAX_LINE_BYTES * 0.8,
+            f"the layout frame is {len(line)} bytes, over 80% of the {protocol.MAX_LINE_BYTES} "
+            "line limit — raise MD_LINK_RX_MAX (and MAX_LINE_BYTES with it) before adding more",
+        )
+
+    def test_a_page_with_no_buttons_says_so(self):
+        """numpad, stats and calendar build themselves — but the keys are still written.
+
+        `"buttons": []` is a statement; a missing key is a shrug. `pos` and `hold` are null for
+        the same reason: `JsonObjectConst::isNull()` is true for both null and absent, so the
+        firmware reads them identically and only the reader gains anything.
+        """
+        by_id = {p["id"]: p for p in self._deck()["pages"]}
+        for page_id in ("numpad", "stats", "calendar"):
+            with self.subTest(page=page_id):
+                self.assertEqual(by_id[page_id]["buttons"], [])
+                self.assertIsNone(by_id[page_id]["grid"])
+
+    def test_build_dependent_defaults_are_left_to_the_build(self):
+        """`dim_opa` and `flip180` default from config.h, so the shipped themes say null.
+
+        A literal here would override the build. `dim_opa` is the one with teeth: it is 0 with
+        the PWM backlight rewire and 55 without, because the veil only has to supply darkness
+        the backlight cannot. Writing this deck's 0 into the file would leave anyone building
+        the unmodified board with a dim state that does nothing at all.
+        """
+        for theme in self._deck()["themes"]:
+            with self.subTest(theme=theme["name"]):
+                self.assertIsNone(theme["dim_opa"])
+                self.assertIsNone(theme["flip180"])
+
+    def test_null_is_accepted_wherever_a_default_lives(self):
+        import tempfile
+
+        theme = {
+            "name": "T",
+            "display": "",
+            "wallpaper": "",
+            "bg": None,
+            "tile_opa": None,
+            "border_opa": None,
+            "radius": None,
+            "dim_opa": None,
+            "flip180": None,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deck.json"
+            path.write_text(
+                json.dumps({"rev": 1, "themes": [theme], "pages": []}), encoding="utf-8"
+            )
+            self.assertEqual(DeckConfig.load(path).theme_names(), ["T"])
+
+    def test_wrong_type_still_rejected_alongside_null(self):
+        import tempfile
+
+        for field, bad in (("tile_opa", "70"), ("radius", True), ("flip180", 1), ("bg", 123)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "deck.json"
+                path.write_text(
+                    json.dumps({"rev": 1, "themes": [{"name": "T", field: bad}], "pages": []}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ConfigError) as caught:
+                    DeckConfig.load(path)
+                self.assertIn(field, str(caught.exception))
+
+
 class IconValidationTests(unittest.TestCase):
     """Presentation fields fail silently on the device, so they are checked here."""
 
@@ -784,6 +986,11 @@ class IconValidationTests(unittest.TestCase):
     def test_no_icon_is_fine(self):
         self._load({"id": "b", "label": "Go", "action": {"type": "page", "target": "p"}})
 
+    def test_empty_display_is_the_written_form_of_unset(self):
+        self._load(
+            {"id": "b", "display": "", "action": {"type": "page", "target": "p"}}
+        )
+
     def test_bad_settings_display_rejected(self):
         import tempfile
 
@@ -797,12 +1004,26 @@ class IconValidationTests(unittest.TestCase):
                 DeckConfig.load(path)
             self.assertIn("settings.display", str(caught.exception))
 
+    def test_empty_settings_display_accepted(self):
+        # Legal but inert: there is no level above `settings`, so a tile lands on the
+        # firmware's own icon_text. Rejecting it would put the shape rule back.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deck.json"
+            path.write_text(
+                json.dumps({"rev": 1, "pages": [], "settings": {"display": ""}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(DeckConfig.load(path).rev, 1)
+
     def test_shipped_deck_has_a_display_baseline(self):
         # Only that a baseline exists, so a theme which says nothing cannot silently land on
         # text and look like the icons were never configured.
         #
-        # Deliberately says nothing about whether themes set `display` themselves — that is a
-        # per-theme choice the format is meant to support, not something to standardise away.
+        # Says nothing about what any theme's own `display` is. ConfigShapeTests requires the
+        # key to be present; its value stays a per-theme choice the format is meant to support,
+        # and `""` — inherit this baseline — is one of the real answers.
         config = DeckConfig.load(REPO / "sdcard" / "deck.json")
 
         self.assertIn(

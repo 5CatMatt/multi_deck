@@ -315,11 +315,17 @@ exactly that reason.
 |---|---|---|
 | `id` | yes | Stable and unique. This is what crosses the wire, so renaming a label never breaks a binding |
 | `label` | yes | Shown on the tile |
-| `icon` | no | Path on SD to an RGB565 `.bin` — see `tools/make_icons.py` |
-| `display` | no | `icon_text` \| `icon` \| `text`. Overrides the theme's default for this tile |
+| `icon` | no | Path on SD to an RGB565 `.bin` — see `tools/make_icons.py`. `""` for none |
+| `display` | no | `icon_text` \| `icon` \| `text`. Overrides the theme's default for this tile. `""` inherits |
 | `action` | yes | One of the action types above |
-| `pos` | no | `{"col":0,"row":0,"w":1,"h":1}` to place/span explicitly. Omit for auto-flow |
-| `hold` | no | A second action fired on long-press (>600ms) |
+| `pos` | no | `{"col":0,"row":0,"w":1,"h":1}` to place/span explicitly. `null` for auto-flow |
+| `hold` | no | A second action fired on long-press (>600ms). `null` for none |
+
+"No" means the firmware supplies a default, not that the key should be missing. Every one of
+them has a written form of unset — `null`, or `""` for the strings — and `sdcard/deck.json`
+uses it, so every button in the file presents the same seven keys in the same order. The
+firmware reads `null` and absent identically (`JsonObjectConst::isNull()` is true for both), so
+this is a change to what the file tells a reader, not to what the device does.
 
 ### Revisions
 
