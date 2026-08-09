@@ -26,7 +26,7 @@ from typing import Any
 from PIL import ImageTk
 
 from deckbuilder import budget, render, writer
-from deckbuilder.model import ModelError, ThemeDoc
+from deckbuilder.model import DeckDoc, ModelError
 from deckbuilder.theme_form import (
     BASE_POINTS,
     DISPLAY_CHOICES,
@@ -116,7 +116,7 @@ def _safe_stem(stem: str) -> str:
 class BuilderApp:
     def __init__(self, root: tk.Tk, path: Path) -> None:
         self.root = root
-        self.doc = ThemeDoc.load(path)
+        self.doc = DeckDoc.load(path)
         self.index = 0
         self.photo: ImageTk.PhotoImage | None = None
         self._pending: str | None = None
@@ -486,10 +486,10 @@ class BuilderApp:
     # -- data plumbing ------------------------------------------------------------------
 
     def _page_titles(self) -> list[str]:
-        return [p.get("title") or p.get("id") or "?" for p in self.doc.raw.get("pages", [])]
+        return [p.get("title") or p.get("id") or "?" for p in self.doc.pages]
 
     def _page_id(self) -> str | None:
-        pages = self.doc.raw.get("pages", [])
+        pages = self.doc.pages
         titles = self._page_titles()
         if self.page_var.get() in titles:
             return pages[titles.index(self.page_var.get())].get("id")
@@ -737,18 +737,28 @@ class BuilderApp:
 
         try:
             result = writer.write(
-                self.doc.path, self.doc.themes, self.doc.settings, rev,
+                self.doc.path,
+                themes=self.doc.themes,
+                settings=self.doc.settings,
+                pages=self.doc.pages,
+                rev=rev,
                 backup_dir=app_dir() / "backups",
             )
         except OSError as exc:
             self._say(f"Could not write {self.doc.path}: {exc}", "error")
+            return
+        except writer.WriteError as exc:
+            # The scope guard or the reparse check fired, which means this build has a bug
+            # rather than the file having a problem. Nothing was written; say so plainly so the
+            # message is not mistaken for "fix your layout".
+            self._say(f"Refusing to write — the writer caught itself: {exc}", "error")
             return
 
         self.doc.mark_saved(result.text, result.rev)
 
         message = f"Saved as rev {result.rev}. Right-click the tray icon → Reload deck.json."
         level = "ok"
-        if not result.spliced:
+        if result.reformatted:
             message += "\n\n" + (result.warning or "")
             level = "warn"
         if report.over_warning:
@@ -762,7 +772,7 @@ class BuilderApp:
             "Revert", "Discard unsaved changes?", parent=self.root
         ):
             return
-        self.doc = ThemeDoc.load(self.doc.path)
+        self.doc = DeckDoc.load(self.doc.path)
         render.clear_asset_cache()
         self._load_theme(self.index)
         self.refresh(immediate=True)
@@ -776,7 +786,7 @@ class BuilderApp:
         if not chosen:
             return
         try:
-            self.doc = ThemeDoc.load(Path(chosen))
+            self.doc = DeckDoc.load(Path(chosen))
         except (OSError, ValueError) as exc:
             messagebox.showerror("Open failed", str(exc), parent=self.root)
             return

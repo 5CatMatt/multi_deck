@@ -1,7 +1,11 @@
-"""The document the editor edits: one deck.json, with themes and settings mutable.
+"""The document the editor edits: one deck.json, with themes, settings and pages mutable.
 
 Holds the file's original text alongside the parsed layout, because the writer needs both — the
-text to splice into, and the object to check the result against.
+text to compare against, and the object to render.
+
+It was called ThemeDoc while themes were all it could change. The name went when `pages` did,
+rather than being kept as an alias: a document that owns the layout and calls itself a theme
+document is a small lie that every future reader has to discover for themselves.
 
 The rule this module exists to enforce is the one deck.json cares most about: every theme
 carries every key the firmware reads, in the same order, with `null` or `""` written down where
@@ -78,28 +82,34 @@ class ModelError(Exception):
     pass
 
 
+# One undo step: everything the document owns, deep-copied.
+State = tuple[list, dict, list]
+
+
 @dataclass
-class ThemeDoc:
+class DeckDoc:
     path: Path
     original: str
     raw: dict[str, Any]
     themes: list[dict[str, Any]]
     settings: dict[str, Any]
+    pages: list[dict[str, Any]]
     field_order: tuple[str, ...]
-    _undo: list[tuple[list, dict]] = field(default_factory=list)
-    _redo: list[tuple[list, dict]] = field(default_factory=list)
+    _undo: list[State] = field(default_factory=list)
+    _redo: list[State] = field(default_factory=list)
 
     # -- loading -------------------------------------------------------------------------
 
     @classmethod
-    def load(cls, path: Path) -> ThemeDoc:
+    def load(cls, path: Path) -> DeckDoc:
         # Bytes, not read_text(): universal newline translation would hand us LF for a CRLF
-        # file and the writer would then splice text that does not match the disk.
+        # file and the writer would then compare against text that does not match the disk.
         original = path.read_bytes().decode("utf-8")
         raw = json.loads(original)
 
         themes = copy.deepcopy(raw.get("themes") or [])
         settings = copy.deepcopy(raw.get("settings") or {})
+        pages = copy.deepcopy(raw.get("pages") or [])
 
         return cls(
             path=path,
@@ -107,6 +117,7 @@ class ThemeDoc:
             raw=raw,
             themes=themes,
             settings=settings,
+            pages=pages,
             field_order=cls._field_order(themes),
         )
 
@@ -130,21 +141,28 @@ class ThemeDoc:
         Called before a change rather than after, so an undo returns you to what you were
         looking at when you touched the control.
         """
-        self._undo.append((copy.deepcopy(self.themes), copy.deepcopy(self.settings)))
+        self._undo.append(self._state())
         self._redo.clear()
+
+    def _state(self) -> State:
+        return (
+            copy.deepcopy(self.themes),
+            copy.deepcopy(self.settings),
+            copy.deepcopy(self.pages),
+        )
 
     def undo(self) -> bool:
         if not self._undo:
             return False
-        self._redo.append((copy.deepcopy(self.themes), copy.deepcopy(self.settings)))
-        self.themes, self.settings = self._undo.pop()
+        self._redo.append(self._state())
+        self.themes, self.settings, self.pages = self._undo.pop()
         return True
 
     def redo(self) -> bool:
         if not self._redo:
             return False
-        self._undo.append((copy.deepcopy(self.themes), copy.deepcopy(self.settings)))
-        self.themes, self.settings = self._redo.pop()
+        self._undo.append(self._state())
+        self.themes, self.settings, self.pages = self._redo.pop()
         return True
 
     def set_theme_field(self, index: int, key: str, value: Any) -> None:
@@ -198,8 +216,8 @@ class ThemeDoc:
         if self.settings.get("theme") == old:
             self.settings["theme"] = name
 
-        for page in self.raw.get("pages", []):
-            for button in page.get("buttons", []):
+        for page in self.pages:
+            for button in page.get("buttons") or []:
                 for slot in ("action", "hold"):
                     _retarget_theme(button.get(slot), old, name)
 
@@ -225,7 +243,11 @@ class ThemeDoc:
 
     @property
     def dirty(self) -> bool:
-        return self.themes != self.raw.get("themes") or self.settings != self.raw.get("settings")
+        return (
+            self.themes != self.raw.get("themes")
+            or self.settings != self.raw.get("settings")
+            or self.pages != self.raw.get("pages")
+        )
 
     @property
     def rev(self) -> int:
@@ -248,6 +270,7 @@ class ThemeDoc:
         merged["rev"] = self.rev if rev is None else rev
         merged["themes"] = self.themes
         merged["settings"] = self.settings
+        merged["pages"] = self.pages
         return merged
 
     def problems(self) -> list[str]:
@@ -285,6 +308,7 @@ class ThemeDoc:
         self.raw["rev"] = rev
         self.raw["themes"] = copy.deepcopy(self.themes)
         self.raw["settings"] = copy.deepcopy(self.settings)
+        self.raw["pages"] = copy.deepcopy(self.pages)
 
 
 def _retarget_theme(action: Any, old: str, new: str) -> None:

@@ -1823,14 +1823,57 @@ class ImagePipelineTests(unittest.TestCase):
         self.assertEqual(_safe_stem("...."), "wallpaper")
 
 
+class DeckFileCanonicalTests(unittest.TestCase):
+    """sdcard/deck.json has to stay in the shape a serialiser writes.
+
+    This is the property that lets the editor own the whole file. It used to splice, which meant
+    hand-formatting elsewhere in the file was safe; now a save renders everything, so a file that
+    has drifted out of canonical form gets silently reflowed on the next save and the diff is
+    unreadable. The check belongs here rather than in the editor, because the thing that breaks
+    it is a hand edit committed to the repo, not anything the editor does.
+    """
+
+    def _text(self) -> str:
+        return (REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8")
+
+    def test_the_shipped_file_is_canonical(self):
+        from deckbuilder import writer
+
+        self.assertTrue(
+            writer.is_canonical(self._text()),
+            "sdcard/deck.json has drifted from json.dumps(indent=2); the next editor save "
+            "will reformat it. Run the normalisation from the v2 plan and commit that alone.",
+        )
+
+    def test_formatting_costs_nothing_on_the_wire(self):
+        """Why the normalisation was safe to do: the deck never sees the indentation."""
+        from deckbuilder import budget, writer
+
+        raw = json.loads(self._text())
+        compacted = json.loads(json.dumps(raw, separators=(",", ":")))
+        self.assertEqual(
+            budget.frame_bytes(raw["rev"], raw),
+            budget.frame_bytes(raw["rev"], json.loads(writer.canonical(compacted))),
+        )
+
+    def test_the_layout_is_pure_ascii(self):
+        """Not style. The meter measures with ensure_ascii, and the file must agree.
+
+        A label containing `→` weighs six bytes on the wire and prints as one character here, so
+        the day this stops being true is the day the byte meter starts under-reporting — and
+        under-reporting is the failure mode the meter exists to prevent.
+        """
+        self._text().encode("ascii")  # raises, with the offending character, if it ever is not
+
+
 class DeckWriterTests(unittest.TestCase):
     """The theme builder rewrites deck.json, so it has to leave the rest of it alone.
 
-    A full json.dump would be correct and unreadable: it reflows the hand-written `seq` steps
-    under `pages` into twenty lines of diff for a one-colour change, and a tool whose diffs you
-    cannot read is one you stop trusting with the master copy. So the writer splices, and these
-    tests are the argument that the splice is safe — starting with the one that matters, which
-    is that rewriting an unchanged file changes nothing at all.
+    The writer used to splice, carrying everything from `"pages":` onward across byte for byte,
+    and these tests were the argument that the splice was safe. It owns pages now, so the
+    argument has changed shape but not subject: the file is rendered whole, and what has to be
+    proved is that rewriting an unchanged file changes nothing at all, and that a save cannot
+    touch a top-level key the writer does not own.
     """
 
     def _text(self) -> str:
@@ -1839,48 +1882,50 @@ class DeckWriterTests(unittest.TestCase):
         return (REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8")
 
     def _doc(self):
-        from deckbuilder.model import ThemeDoc
+        from deckbuilder.model import DeckDoc
 
-        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
 
-    def _tail(self, text: str) -> str:
+    def _build(self, original: str, **changes):
+        """Rebuilds the file from its own contents, with `changes` applied."""
         from deckbuilder import writer
 
-        return text[text.find(writer.ANCHOR.format(key="pages")):]
+        data = json.loads(original)
+        args = {key: json.loads(json.dumps(data[key])) for key in writer.OWNED}
+        args.update(changes)
+        return writer.build(original, **args)
 
     def test_rewriting_an_unchanged_file_is_byte_identical(self):
-        from deckbuilder import writer
-
+        """The acceptance test for the whole module: open, save, `git diff` is empty."""
         original = self._text()
-        data = json.loads(original)
-        result, spliced = writer.build(original, data["themes"], data["settings"], data["rev"])
+        result, reformatted = self._build(original)
 
-        self.assertTrue(spliced, "fell back to a full re-dump on the shipped file")
+        self.assertFalse(reformatted, "the shipped file is not in canonical form")
         self.assertEqual(result, original)
 
     def test_changing_a_colour_leaves_pages_untouched(self):
-        from deckbuilder import writer
-
         original = self._text()
         data = json.loads(original)
         themes = json.loads(json.dumps(data["themes"]))
         themes[0]["accent"] = "#ff0000"
 
-        result, spliced = writer.build(original, themes, data["settings"], data["rev"] + 1)
-        self.assertTrue(spliced)
-        self.assertEqual(self._tail(result), self._tail(original))
+        result, reformatted = self._build(original, themes=themes, rev=data["rev"] + 1)
+        self.assertFalse(reformatted)
+        # Semantic, not textual. The old writer proved this by comparing the tail of the file
+        # byte for byte, which it could only do while pages were a contiguous suffix it never
+        # rendered. Now they are rendered like everything else, so the claim worth making is
+        # that they still mean exactly what they meant.
+        self.assertEqual(json.loads(result)["pages"], data["pages"])
         self.assertEqual(json.loads(result)["themes"][0]["accent"], "#ff0000")
 
     def test_the_diff_is_only_the_lines_that_changed(self):
-        """The whole reason the splice exists, stated as a number."""
-        from deckbuilder import writer
-
+        """Why the file was normalised: a one-colour save is still a two-line diff."""
         original = self._text()
         data = json.loads(original)
         themes = json.loads(json.dumps(data["themes"]))
         themes[0]["accent"] = "#ff0000"
 
-        result, _ = writer.build(original, themes, data["settings"], data["rev"] + 1)
+        result, _ = self._build(original, themes=themes, rev=data["rev"] + 1)
         changed = [
             (a, b)
             for a, b in zip(original.splitlines(), result.splitlines())
@@ -1894,31 +1939,75 @@ class DeckWriterTests(unittest.TestCase):
         original = self._text()
         self.assertEqual(writer.newline_style(original), "\r\n", "fixture is no longer CRLF")
 
-        data = json.loads(original)
-        result, _ = writer.build(original, data["themes"], data["settings"], 99)
+        result, _ = self._build(original, rev=99)
         self.assertEqual(writer.newline_style(result), "\r\n")
         # Every LF belongs to a CRLF — no line was left half-converted.
         self.assertNotIn("\n", result.replace("\r\n", ""))
 
     def test_lf_files_stay_lf(self):
-        from deckbuilder import writer
-
         original = self._text().replace("\r\n", "\n")
-        data = json.loads(original)
-        result, spliced = writer.build(original, data["themes"], data["settings"], data["rev"])
-        self.assertTrue(spliced)
+        result, reformatted = self._build(original)
+        self.assertFalse(reformatted)
         self.assertEqual(result, original)
 
-    def test_a_reformatted_file_falls_back_rather_than_guessing(self):
+    def test_a_file_that_was_formatted_by_hand_says_so_before_the_diff_does(self):
+        """Saving normalises it. That is allowed, but it must never be a surprise."""
         from deckbuilder import writer
 
         original = json.dumps(json.loads(self._text()), indent=4) + "\n"
         data = json.loads(original)
-        result, spliced = writer.build(original, data["themes"], data["settings"], 42)
+        result, reformatted = self._build(original, rev=42)
 
-        self.assertFalse(spliced, "spliced a file it had no right to recognise")
+        self.assertTrue(reformatted, "reformatted the file without admitting it")
+        self.assertIn("reformatted", writer.SaveResult(Path("x"), 42, True).warning or "")
         self.assertEqual(json.loads(result)["rev"], 42)
         self.assertEqual(json.loads(result)["pages"], data["pages"])
+
+    def test_mixed_line_endings_are_never_claimed_to_survive(self):
+        from deckbuilder import writer
+
+        original = self._text().replace("\r\n", "\n", 5)
+        self.assertIsNone(writer.newline_style(original))
+        _result, reformatted = self._build(original)
+        self.assertTrue(reformatted)
+
+    def test_a_key_the_writer_does_not_own_comes_through_untouched(self):
+        """The honest successor to the old "the tail is unchanged" check.
+
+        A future firmware key has to survive a save it knows nothing about, wherever in the file
+        it sits — including before `pages`, which the splice could never have protected.
+        """
+        from deckbuilder import writer
+
+        data = json.loads(self._text())
+        spiked = {"schema": {"note": "not ours"}, **data, "trailing": [1, 2, 3]}
+        original = writer.canonical(spiked)
+
+        result, _ = self._build(original, rev=data["rev"] + 1)
+        written = json.loads(result)
+        self.assertEqual(written["schema"], {"note": "not ours"})
+        self.assertEqual(written["trailing"], [1, 2, 3])
+        self.assertEqual(list(written), list(spiked), "top-level keys were reordered")
+
+    def test_the_scope_guard_catches_a_writer_that_overreaches(self):
+        from deckbuilder import writer
+
+        before = {"rev": 1, "nav": {"macros": "x"}, "themes": [], "settings": {}, "pages": []}
+        writer.check_scope(before, dict(before, rev=2, themes=[{"name": "a"}]))
+
+        with self.assertRaises(writer.WriteError):
+            writer.check_scope(before, dict(before, nav={"macros": "y"}))
+        with self.assertRaises(writer.WriteError):
+            writer.check_scope(before, {k: v for k, v in before.items() if k != "nav"})
+        with self.assertRaises(writer.WriteError):
+            writer.check_scope(before, dict(sorted(before.items())))
+
+    def test_an_owned_key_the_file_never_had_may_be_appended(self):
+        """A deck.json with no pages at all gains one the first time a page is added."""
+        from deckbuilder import writer
+
+        before = {"rev": 1, "themes": [], "settings": {}}
+        writer.check_scope(before, dict(before, pages=[{"id": "home"}]))
 
     def test_the_written_file_still_loads(self):
         import tempfile
@@ -1930,7 +2019,10 @@ class DeckWriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "deck.json"
             path.write_bytes(self._text().encode("utf-8"))
-            writer.write(path, doc.themes, doc.settings, doc.next_rev())
+            writer.write(
+                path, themes=doc.themes, settings=doc.settings, pages=doc.pages,
+                rev=doc.next_rev(),
+            )
 
             reloaded = DeckConfig.load(path)  # validates, and raises if it cannot
             self.assertEqual(reloaded.rev, doc.next_rev())
@@ -1948,7 +2040,10 @@ class DeckWriterTests(unittest.TestCase):
             path.write_bytes(self._text().encode("utf-8"))
 
             doc = self._doc()
-            writer.write(path, doc.themes, doc.settings, 77, backup_dir=folder / "elsewhere")
+            writer.write(
+                path, themes=doc.themes, settings=doc.settings, pages=doc.pages, rev=77,
+                backup_dir=folder / "elsewhere",
+            )
 
             self.assertEqual(
                 sorted(p.name for p in folder.iterdir()), ["deck.json", "elsewhere"]
@@ -1975,9 +2070,9 @@ class ThemeShapeTests(unittest.TestCase):
     """
 
     def _doc(self):
-        from deckbuilder.model import ThemeDoc
+        from deckbuilder.model import DeckDoc
 
-        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
 
     def _reference(self) -> tuple:
         deck = json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8"))
@@ -2020,17 +2115,15 @@ class ThemeShapeTests(unittest.TestCase):
         doc.new_theme("Midnight")
         self.assertNotEqual(doc.themes[-1]["name"], "Midnight")
 
-    def test_the_writer_refuses_a_drifted_theme(self):
-        from deckbuilder import writer
+    def test_a_drifted_theme_is_refused_before_it_reaches_the_writer(self):
+        """The splice used to catch this by failing to regenerate the block.
 
+        Nothing structural catches it now — a dump will happily write a theme with a missing
+        key — so the guard has to be explicit, and it has to be the thing the save button reads.
+        """
         doc = self._doc()
         del doc.themes[0]["idle"]
-        with self.assertRaises(writer.WriteError):
-            writer.splice(
-                (REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"),
-                json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8")),
-                doc.themes, doc.settings, 1,
-            )
+        self.assertTrue(doc.shape_problems())
 
     def test_renaming_follows_the_references(self):
         """A theme is referenced by name, and a stale name fails silently on the device."""
@@ -2042,14 +2135,24 @@ class ThemeShapeTests(unittest.TestCase):
         self.assertEqual(doc.problems(), [])
 
     def test_renaming_follows_theme_actions_including_nested_ones(self):
+        """Poked through `doc.pages`, which is the copy a save actually writes.
+
+        This test used to reach into `doc.raw["pages"]`, and would have gone on passing while
+        renaming quietly stopped following references — because `rename()` walked the same raw
+        dict the test was inspecting, rather than the list the document owns.
+        """
         doc = self._doc()
-        page = doc.raw["pages"][0]
+        page = next(p for p in doc.pages if p.get("buttons"))
         page["buttons"][0]["action"] = {
             "type": "seq",
             "steps": [{"type": "theme", "target": doc.themes[0]["name"]}],
         }
         doc.rename(0, "Elsewhere")
+
         self.assertEqual(page["buttons"][0]["action"]["steps"][0]["target"], "Elsewhere")
+        saved = doc.candidate_raw()["pages"]
+        self.assertEqual(saved[doc.pages.index(page)]["buttons"][0]["action"]["steps"][0]
+                         ["target"], "Elsewhere")
 
     def test_rev_bumps_only_when_something_changed(self):
         doc = self._doc()
@@ -2161,16 +2264,16 @@ class PreviewRenderTests(unittest.TestCase):
             self.skipTest("Pillow not installed")
 
     def _doc(self):
-        from deckbuilder.model import ThemeDoc
+        from deckbuilder.model import DeckDoc
 
-        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
 
     def test_every_shipped_theme_and_page_renders(self):
         from deckbuilder import render
 
         doc = self._doc()
         for theme in doc.themes:
-            for page in doc.raw["pages"]:
+            for page in doc.pages:
                 with self.subTest(theme=theme["name"], page=page["id"]):
                     preview = render.render_page(
                         doc.candidate_raw(), theme, page["id"],
