@@ -60,10 +60,14 @@ def enable_dpi_awareness() -> None:
     """Opts into real pixels before Tk starts.
 
     Without this Windows renders the window at 96 DPI and bitmap-stretches it, which blurs the
-    preview — and blurring the preview defeats the point of having one. It also makes the app
-    behave the same run from source as it does packaged: PyInstaller's manifest marks the exe
-    DPI-aware, so without this call the two disagree about what a pixel is, and any layout
-    arithmetic that works in one is wrong in the other.
+    preview — and blurring the preview defeats the point of having one.
+
+    This call is the only thing that does it. An earlier version of this comment claimed
+    PyInstaller's manifest marks the exe DPI-aware, so that the call was really about making a
+    source run match a packaged one; that is not true. The manifest PyInstaller embeds carries
+    requestedExecutionLevel, the supportedOS list, longPathAware and a Common-Controls
+    dependency, and says nothing about DPI at all — checked by reading it out of the built exe.
+    Which means source and packaged runs already agree, and both of them need this.
 
     Fonts are then scaled back up from the display's DPI, so 12pt stays 12pt on the eye rather
     than becoming 12 device pixels.
