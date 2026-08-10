@@ -28,25 +28,32 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 
 from deckbuilder import icons
+
+# The layout arithmetic lives in geometry.py, which the model and the canvas also use — a preview
+# and a validator that disagreed about where a tile lands would be worse than having neither.
+# Re-exported here because this is where callers have always looked for it.
+from deckbuilder.geometry import (  # noqa: F401
+    NAV_H,
+    PAD,
+    SCREEN_H,
+    SCREEN_W,
+    TAB_H,
+    TAB_STEP,
+    TAB_W,
+    as_int as _int_or,
+    auto_flow,
+    cell_at,
+    cells as _cells,
+    grid_size,
+    tile_box as _tile_box,
+)
 from deckhost import mdi1
 from deckhost.config import is_device_local
 
-# firmware/multi_deck/config.h
-SCREEN_W = 800
-SCREEN_H = 480
-
-# firmware/multi_deck/theme.h:67-72
-NAV_H = 56
-PAD = 8
 CARD_PAD = PAD + 4
 
 # firmware/multi_deck/ui_builder.cpp:273
 ICON_GAP = 6
-
-# Nav tabs: ui_builder.cpp:522 sizes them 120 x NAV_H-16, and :534 steps x by 128.
-TAB_W = 120
-TAB_H = NAV_H - 16
-TAB_STEP = 128
 
 # Status dot: ui_builder.cpp:539-540, right-aligned with a PAD margin, centred in the bar.
 DOT = 14
@@ -108,6 +115,29 @@ class Preview:
     image: Image.Image
     warnings: list[str] = field(default_factory=list)
     font_name: str = ""
+
+    # What was drawn, so the canvas can turn a click back into a tile. Insertion-ordered by
+    # draw order, which is LVGL's z-order too (creation order), so hit-testing `reversed()`
+    # picks the tile that is visually on top of an overlap.
+    boxes: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+
+    # Where auto-flow actually put each tile: id -> (col, row, w, h). The editor needs this to
+    # write a pin that does not move anything, and it is not derivable from deck.json alone.
+    placed: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+
+    # Tiles the firmware would not build at all. Absent from `boxes`, because they are absent
+    # from the panel — listed here so the window can say so rather than leaving a hole.
+    skipped: list[str] = field(default_factory=list)
+
+    # (cols, rows) of the page drawn, or None if it was not a grid page.
+    cell: tuple[int, int] | None = None
+
+    def at(self, x: int, y: int) -> str | None:
+        """The id of the topmost tile under a point."""
+        for button_id, (x0, y0, x1, y1) in reversed(list(self.boxes.items())):
+            if x0 <= x < x1 and y0 <= y < y1:
+                return button_id
+        return None
 
 
 # -- colour ------------------------------------------------------------------------------
@@ -410,45 +440,45 @@ def clear_asset_cache() -> None:
 # -- pages -------------------------------------------------------------------------------
 
 
-def _cells(cols: int, rows: int) -> tuple[int, int]:
-    """C integer division, deliberately — ui_builder.cpp:400-401.
-
-    (424 - 8*4)//3 is 130, not 130.67, and the 10px left over at the bottom of a 3-row grid is
-    a real gap on the panel. Rounding it away here would make the preview subtly wrong in the
-    one dimension people notice.
-    """
-    return (
-        (SCREEN_W - PAD * (cols + 1)) // cols,
-        (SCREEN_H - NAV_H - PAD * (rows + 1)) // rows,
-    )
-
-
-def _tile_box(col: int, row: int, w: int, h: int, cell_w: int, cell_h: int) -> tuple:
-    x = PAD + col * (cell_w + PAD)
-    y = NAV_H + PAD + row * (cell_h + PAD)
-    return x, y, x + cell_w * w + PAD * (w - 1), y + cell_h * h + PAD * (h - 1)
-
-
 def _draw_grid_page(
     base: Image.Image, page: dict, theme: dict, settings: dict, *, link_up: bool,
-    state: str, asset_root: Path | None, warnings: list[str],
+    state: str, asset_root: Path | None, warnings: list[str], preview: Preview,
 ) -> None:
-    grid = page.get("grid") or {}
-    cols = grid.get("cols") or 4
-    rows = grid.get("rows") or 3
+    cols, rows = grid_size(page.get("grid"))
     cell_w, cell_h = _cells(cols, rows)
     radius = radius_of(theme)
+    preview.cell = (cols, rows)
 
     flow = 0
     for index, button in enumerate(page.get("buttons") or []):
         pos = button.get("pos") or {}
-        col, row = pos.get("col", -1), pos.get("row", -1)
+        col, row = _int_or(pos.get("col"), -1), _int_or(pos.get("row"), -1)
+        w, h = _int_or(pos.get("w"), 1), _int_or(pos.get("h"), 1)
+
         if col < 0 or row < 0:
+            # ui_builder.cpp:409 — flow++ fires only in this branch, so a pinned tile consumes
+            # no slot and every auto tile after it shifts.
             col, row = flow % cols, flow // cols
             flow += 1
+
+        button_id = button.get("id") or f"[{index}]"
+        preview.placed[button_id] = (col, row, max(1, w), max(1, h))
+
         if row >= rows:
             warnings.append(f"{button.get('id')}: falls outside the {cols}x{rows} grid")
+            preview.skipped.append(button_id)
             continue
+        if col + w > cols:
+            # The device logs nothing for this at all. The tile is created at its computed x and
+            # simply extends past the 800px edge, so from the deck it reads as a tile that is
+            # not there — hence saying it here, where it can still be fixed.
+            warnings.append(
+                f"{button.get('id')}: starts at column {col} and spans {w}, "
+                f"past the {cols}-column grid"
+            )
+        if w < 1 or h < 1:
+            warnings.append(f"{button.get('id')}: pos w/h is {w}x{h}, drawn as 1x1")
+            w, h = max(1, w), max(1, h)
 
         # ui_builder.cpp:421 — a tile whose action the agent has to run is dead without it.
         enabled = is_device_local(button.get("action") or {}) or link_up
@@ -457,7 +487,8 @@ def _draw_grid_page(
             tile_state = "disabled"
 
         fill_opa, border_opa, accent = _tile_state(theme, tile_state)
-        box = _tile_box(col, row, pos.get("w", 1) or 1, pos.get("h", 1) or 1, cell_w, cell_h)
+        box = _tile_box(col, row, w, h, cell_w, cell_h)
+        preview.boxes[button_id] = box
         draw_card(
             base, box, theme,
             fill_opa=fill_opa, radius=radius, border_opa=border_opa,
@@ -515,7 +546,8 @@ def _draw_panel_page(base: Image.Image, page: dict, theme: dict) -> None:
 
 
 def _draw_nav(
-    base: Image.Image, raw: dict, theme: dict, active_page_id: str, link_up: bool
+    base: Image.Image, raw: dict, theme: dict, active_page_id: str, link_up: bool,
+    warnings: list[str],
 ) -> None:
     # theme.cpp:207-212 — the bar only carries a scrim when there is a wallpaper behind it.
     if theme.get("wallpaper"):
@@ -525,8 +557,17 @@ def _draw_nav(
     radius = min(radius_of(theme), TAB_MAX_RADIUS)
     for index, page in enumerate(raw.get("pages") or []):
         x = PAD + index * TAB_STEP
+
+        # The firmware does not stop here (ui_builder.cpp:516-534): it creates every tab and
+        # lets the non-scrollable nav container clip whatever runs past 800px. This used to
+        # break instead, which made the preview clean at exactly the point the deck stops
+        # being usable — the one case where it most needed to show you the problem.
         if x + TAB_W > SCREEN_W:
-            break
+            warnings.append(
+                f"page {page.get('id')!r}: the nav bar fits {(SCREEN_W - PAD) // TAB_STEP} "
+                "tabs, and this one is cut off at the edge with no way to reach it"
+            )
+
         active = page.get("id") == active_page_id
         draw_card(
             base, (x, PAD, x + TAB_W, PAD + TAB_H), theme,
@@ -568,6 +609,7 @@ def render_page(
     settings = raw.get("settings") or {}
 
     base = Image.new("RGB", (SCREEN_W, SCREEN_H), token(theme, "bg"))
+    preview = Preview(image=base, warnings=warnings, font_name=face_description())
 
     wallpaper = theme.get("wallpaper") or ""
     if wallpaper:
@@ -580,12 +622,12 @@ def render_page(
     kind = page.get("type") or "grid"
     if kind == "grid":
         _draw_grid_page(base, page, theme, settings, link_up=link_up, state=state,
-                        asset_root=asset_root, warnings=warnings)
+                        asset_root=asset_root, warnings=warnings, preview=preview)
     elif kind == "numpad":
         _draw_numpad_page(base, theme)
     else:
         _draw_panel_page(base, page, theme)
 
-    _draw_nav(base, raw, theme, page.get("id"), link_up)
+    _draw_nav(base, raw, theme, page.get("id"), link_up, warnings)
 
-    return Preview(image=base, warnings=warnings, font_name=face_description())
+    return preview

@@ -156,7 +156,7 @@ Full reference: [docs/editing-the-deck.md](docs/editing-the-deck.md).
 |---|---|
 | `firmware/multi_deck/` | Arduino sketch. Open `multi_deck.ino` in the Arduino IDE. |
 | `agent/deckhost/` | Python agent that runs on the PC at logon. |
-| `agent/deckbuilder/` | Theme editor: a tkinter window with a live preview of the deck. |
+| `agent/deckbuilder/` | Layout editor: a tkinter window with a live preview of the deck. |
 | `sdcard/` | Version-controlled mirror of what belongs on the SD card. |
 | `tools/` | `make_assets.py` (wallpaper/icon converter), `theme_builder.py`, protocol conformance harness. |
 | `docs/` | Wire protocol spec, hardware facts learned the hard way, and the backlog. |
@@ -165,9 +165,10 @@ Full reference: [docs/editing-the-deck.md](docs/editing-the-deck.md).
 Development is paused at firmware `0.5.4` to use the deck and gather UI/UX feedback; that file
 holds the remaining backlog, the rejected ideas and why, and a log to record observations in.
 
-**Changing what the deck shows** — edit `sdcard/deck.json` and hit *Reload deck.json* in the tray.
-For colours, `python tools/theme_builder.py` gives you swatches and a live 800×480 preview of
-your own pages instead. See [docs/editing-the-deck.md](docs/editing-the-deck.md).
+**Changing what the deck shows** — `python tools/theme_builder.py` edits themes, pages and buttons
+against a live 800×480 preview of your own layout, with the byte cost of every change shown before
+it commits. Hand-editing `sdcard/deck.json` still works exactly as it did. Either way, hit *Reload
+deck.json* in the tray afterwards. See [docs/editing-the-deck.md](docs/editing-the-deck.md).
 
 ## Getting started
 

@@ -738,6 +738,263 @@ class IconNameTests(unittest.TestCase):
                 self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
 
 
+class HidTokenTests(unittest.TestCase):
+    """config.py's key tables and hid.cpp's must be the same tables, for ICON_NAMES' reasons.
+
+    The failure is worse here than for icons, though. An unknown icon name degrades to showing
+    the tile's text label; an unknown key token makes sendCombo() reject the *whole chord* and
+    return, so the tile types nothing at all. Both write a line to UART0, which in daily use is
+    not attached to anything.
+    """
+
+    def _source(self) -> str:
+        return (REPO / "firmware" / "multi_deck" / "hid.cpp").read_text(encoding="utf-8")
+
+    def _table(self, name: str) -> set[str]:
+        table = re.search(rf"{name}\[\]\s*=\s*\{{(.*?)\n\}};", self._source(), re.S)
+        self.assertIsNotNone(table, f"could not find {name} in hid.cpp")
+        return set(re.findall(r'\{"([A-Z0-9_]+)",', table.group(1)))
+
+    def test_key_names_agree(self):
+        from deckhost.config import HID_KEY_NAMES
+
+        firmware = self._table("kNamedKeys")
+        self.assertTrue(firmware, "parsed no key names out of hid.cpp")
+        self.assertEqual(firmware, set(HID_KEY_NAMES), "hid.cpp and HID_KEY_NAMES have drifted")
+
+    def test_modifiers_agree(self):
+        from deckhost.config import HID_MODIFIERS
+
+        firmware = self._table("kNamedModifiers")
+        self.assertTrue(firmware, "parsed no modifiers out of hid.cpp")
+        self.assertEqual(firmware, set(HID_MODIFIERS), "hid.cpp and HID_MODIFIERS have drifted")
+
+    def test_media_keys_agree(self):
+        from deckhost.config import MEDIA_KEYS
+
+        # sendMedia is a strcmp chain rather than a table, so the keys are read from the
+        # comparisons themselves.
+        body = re.search(r"\bsendMedia\(const String.*?\n\}", self._source(), re.S)
+        self.assertIsNotNone(body, "could not find sendMedia in hid.cpp")
+        firmware = set(re.findall(r'key == "([a-z_]+)"', body.group(0)))
+
+        self.assertTrue(firmware, "parsed no media keys out of hid.cpp")
+        self.assertEqual(firmware, set(MEDIA_KEYS), "hid.cpp and MEDIA_KEYS have drifted")
+
+    def test_the_report_limit_matches_the_firmware(self):
+        from deckhost.config import HID_MAX_KEYS
+
+        self.assertRegex(self._source(), rf"key_count < {HID_MAX_KEYS}\b")
+
+    def test_single_characters_resolve_arithmetically(self):
+        """The branch with no table behind it, and the one an editor has to explain.
+
+        An upper-case letter implies SHIFT on the device, so ["A"] and ["a"] are different
+        keystrokes — which is not visible from reading deck.json.
+        """
+        from deckhost.config import resolve_hid_token
+
+        for token in ("a", "z", "A", "Z", "0", "9"):
+            with self.subTest(token=token):
+                self.assertEqual(resolve_hid_token(token), "key")
+
+        self.assertIsNone(resolve_hid_token("ab"))
+        self.assertIsNone(resolve_hid_token("é"))
+        self.assertIsNone(resolve_hid_token(""))
+        self.assertIsNone(resolve_hid_token(None))
+
+    def test_matching_is_case_insensitive_like_the_firmware(self):
+        from deckhost.config import resolve_hid_token
+
+        self.assertEqual(resolve_hid_token("ctrl"), "modifier")
+        self.assertEqual(resolve_hid_token("Ctrl"), "modifier")
+        self.assertEqual(resolve_hid_token("PAGEUP"), "key")
+        self.assertEqual(resolve_hid_token("pageup"), "key")
+
+
+class ActionValidationTests(unittest.TestCase):
+    """Every action field the firmware or the agent reads, checked before it ships.
+
+    None of this was checked while buttons were written by hand: you copied a working one and
+    changed the target. From a form, `{"type": "launch"}` with no target is two clicks — and
+    every failure here is silent from where you are standing, so the validator has to come
+    before the UI that makes them easy.
+    """
+
+    def _config(self, action, **button):
+        return DeckConfig.from_raw(
+            {
+                "rev": 1,
+                "themes": [{"name": "T"}],
+                "settings": {},
+                "pages": [
+                    {"id": "home", "buttons": [{"id": "b", "action": action, **button}]}
+                ],
+            },
+            validate=False,
+        )
+
+    def _problems(self, action, **button) -> str:
+        return " | ".join(self._config(action, **button).problems())
+
+    def test_an_action_missing_its_only_useful_field_is_caught(self):
+        for action, field_name in (
+            ({"type": "launch"}, "target"),
+            ({"type": "shell"}, "cmd"),
+            ({"type": "ahk"}, "fn"),
+            ({"type": "hid"}, "keys"),
+            ({"type": "hid_text"}, "text"),
+            ({"type": "media"}, "key"),
+            ({"type": "seq"}, "steps"),
+        ):
+            with self.subTest(type=action["type"]):
+                self.assertIn(f"no {field_name}", self._problems(action))
+
+    def test_an_empty_string_is_as_useless_as_an_absent_key(self):
+        """Which is what an untouched form field produces."""
+        self.assertIn("no target", self._problems({"type": "launch", "target": ""}))
+
+    def test_a_theme_action_may_have_no_target(self):
+        """Empty means "next", and that is a real thing to write."""
+        self.assertEqual(self._problems({"type": "theme", "target": ""}), "")
+
+    def test_an_unknown_action_type_is_named(self):
+        self.assertIn("action type is 'lanch'", self._problems({"type": "lanch", "target": "x"}))
+
+    def test_a_rejected_chord_is_caught_before_it_silently_types_nothing(self):
+        self.assertIn(
+            "not one the device knows",
+            self._problems({"type": "hid", "keys": ["ctrl", "shfit", "c"]}),
+        )
+        self.assertEqual(self._problems({"type": "hid", "keys": ["ctrl", "SHIFT", "c"]}), "")
+
+    def test_seven_keys_is_a_rejected_chord_not_a_truncated_one(self):
+        keys = ["a", "b", "c", "d", "e", "f", "g"]
+        self.assertIn("rejects the whole chord", self._problems({"type": "hid", "keys": keys}))
+        self.assertEqual(self._problems({"type": "hid", "keys": keys[:6]}), "")
+
+    def test_modifiers_alone_type_nothing(self):
+        self.assertIn(
+            "nothing is typed", self._problems({"type": "hid", "keys": ["ctrl", "shift"]})
+        )
+
+    def test_an_unknown_media_key_is_named(self):
+        self.assertIn(
+            "media key 'volume_up'", self._problems({"type": "media", "key": "volume_up"})
+        )
+
+    def test_a_delay_needs_a_number(self):
+        self.assertIn("delay ms is '250'", self._problems({"type": "delay", "ms": "250"}))
+        self.assertEqual(self._problems({"type": "delay", "ms": 250}), "")
+
+    def test_nested_steps_are_checked_too(self):
+        action = {"type": "seq", "steps": [{"type": "delay", "ms": 50}, {"type": "shell"}]}
+        self.assertIn("no cmd", self._problems(action))
+
+    def test_a_hold_is_validated_like_an_action(self):
+        """The least visible thing on a deck: nothing about a tile says it has a long press."""
+        problems = self._problems(
+            {"type": "launch", "target": "notepad.exe"},
+            hold={"type": "page", "target": "nowhere"},
+        )
+        self.assertIn("b (hold)", problems)
+        self.assertIn("unknown page", problems)
+
+    def test_duplicate_page_ids_are_caught(self):
+        raw = {
+            "rev": 1,
+            "themes": [{"name": "T"}],
+            "pages": [{"id": "home", "buttons": []}, {"id": "home", "buttons": []}],
+        }
+        problems = DeckConfig.from_raw(raw, validate=False).problems()
+        self.assertIn("duplicate page id 'home'", " | ".join(problems))
+
+    def test_a_page_with_no_id_cannot_be_navigated_to(self):
+        raw = {"rev": 1, "themes": [{"name": "T"}], "pages": [{"buttons": []}]}
+        problems = DeckConfig.from_raw(raw, validate=False).problems()
+        self.assertIn("has no id", " | ".join(problems))
+
+    def test_the_shipped_layout_passes_all_of_it(self):
+        """The point of adding checks is to find real mistakes, not to invent them."""
+        self.assertEqual(DeckConfig.load(REPO / "sdcard" / "deck.json").problems(), [])
+
+    def test_an_unknown_ahk_function_warns_rather_than_refusing_to_start(self):
+        """lib.ahk is a file you are meant to edit, so an unknown name may be one not yet written."""
+        config = self._config({"type": "ahk", "fn": "NotAHelper"})
+        self.assertEqual(config.problems(), [])
+        self.assertIn("NotAHelper", " | ".join(config.warnings()))
+
+    def test_the_shipped_ahk_functions_all_exist(self):
+        self.assertEqual(DeckConfig.load(REPO / "sdcard" / "deck.json").warnings(), [])
+
+
+class HoldDispatchTests(unittest.TestCase):
+    """A long press the device cannot run itself arrives under a different id than it left.
+
+    ui_builder.cpp sends `<id>.hold`, and the agent's index is keyed by the ids in deck.json —
+    so every agent-side hold answered "Unknown button" and toasted it. A device-local hold ran
+    fine, which is what kept this hidden: the ten-key's holds work, and those are the ones you
+    press while testing.
+    """
+
+    def _config(self):
+        return DeckConfig.from_raw(
+            {
+                "rev": 1,
+                "themes": [{"name": "T"}],
+                "pages": [
+                    {
+                        "id": "home",
+                        "buttons": [
+                            {
+                                "id": "edit.paste",
+                                "action": {"type": "hid", "keys": ["ctrl", "v"]},
+                                "hold": {"type": "ahk", "fn": "PasteInto", "args": ["x"]},
+                            }
+                        ],
+                    }
+                ],
+            },
+            validate=False,
+        )
+
+    def test_the_suffix_matches_the_firmware(self):
+        from deckhost.config import HOLD_SUFFIX
+
+        source = (REPO / "firmware" / "multi_deck" / "ui_builder.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f'button.id + "{HOLD_SUFFIX}"', source)
+
+    def test_a_hold_press_resolves_to_the_hold_action(self):
+        config = self._config()
+        self.assertEqual(config.action_for("edit.paste.hold"), config.buttons["edit.paste"]["hold"])
+
+    def test_a_plain_press_still_resolves_to_the_plain_action(self):
+        self.assertEqual(self._config().action_for("edit.paste")["type"], "hid")
+
+    def test_an_exact_id_wins_over_the_suffix_rule(self):
+        """A button someone genuinely named `foo.hold` must not be shadowed."""
+        raw = {
+            "rev": 1,
+            "themes": [{"name": "T"}],
+            "pages": [
+                {
+                    "id": "home",
+                    "buttons": [
+                        {"id": "foo", "hold": {"type": "shell", "cmd": "wrong"}},
+                        {"id": "foo.hold", "action": {"type": "shell", "cmd": "right"}},
+                    ],
+                }
+            ],
+        }
+        config = DeckConfig.from_raw(raw, validate=False)
+        self.assertEqual(config.action_for("foo.hold")["cmd"], "right")
+
+    def test_an_unknown_hold_is_still_unknown(self):
+        self.assertIsNone(self._config().action_for("nosuch.hold"))
+
+
 class ConfigShapeTests(unittest.TestCase):
     """deck.json is a socket: objects of the same kind present the same keys.
 
@@ -952,7 +1209,9 @@ class IconValidationTests(unittest.TestCase):
         self.assertIn(fragment, str(caught.exception))
 
     def test_known_symbol_accepted(self):
-        self._load({"id": "b", "icon": "play", "action": {"type": "media", "key": "play"}})
+        # The icon is `play`; the media key is `play_pause`. They are not the same vocabulary,
+        # which is easy to forget and is now caught.
+        self._load({"id": "b", "icon": "play", "action": {"type": "media", "key": "play_pause"}})
 
     def test_sd_path_accepted_without_touching_the_card(self):
         self._load(
@@ -1759,6 +2018,28 @@ class ImagePipelineTests(unittest.TestCase):
                     "app.py reads sys.executable, which in a frozen build is the builder itself",
                 )
 
+    def test_every_check_the_save_button_is_given_is_a_check_it_makes(self):
+        """`_can_save(self, problems)` took the validator's list and never looked at it.
+
+        It read as though the check existed, so the save button stayed lit for a layout the
+        agent refuses — which makes the agent exit 2 at logon, and the deck keeps whatever it
+        had. Static, because reaching this through tkinter means standing up a window.
+        """
+        import ast
+
+        tree = ast.parse((REPO / "agent" / "deckbuilder" / "app.py").read_text(encoding="utf-8"))
+        target = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_can_save"
+        )
+
+        parameters = [arg.arg for arg in target.args.args if arg.arg != "self"]
+        used = {node.id for node in ast.walk(target) if isinstance(node, ast.Name)}
+        for name in parameters:
+            with self.subTest(parameter=name):
+                self.assertIn(name, used, f"_can_save takes {name!r} and ignores it")
+
     def test_wallpaper_fills_the_panel_from_any_aspect_ratio(self):
         import tempfile
 
@@ -1823,14 +2104,57 @@ class ImagePipelineTests(unittest.TestCase):
         self.assertEqual(_safe_stem("...."), "wallpaper")
 
 
+class DeckFileCanonicalTests(unittest.TestCase):
+    """sdcard/deck.json has to stay in the shape a serialiser writes.
+
+    This is the property that lets the editor own the whole file. It used to splice, which meant
+    hand-formatting elsewhere in the file was safe; now a save renders everything, so a file that
+    has drifted out of canonical form gets silently reflowed on the next save and the diff is
+    unreadable. The check belongs here rather than in the editor, because the thing that breaks
+    it is a hand edit committed to the repo, not anything the editor does.
+    """
+
+    def _text(self) -> str:
+        return (REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8")
+
+    def test_the_shipped_file_is_canonical(self):
+        from deckbuilder import writer
+
+        self.assertTrue(
+            writer.is_canonical(self._text()),
+            "sdcard/deck.json has drifted from json.dumps(indent=2); the next editor save "
+            "will reformat it. Run the normalisation from the v2 plan and commit that alone.",
+        )
+
+    def test_formatting_costs_nothing_on_the_wire(self):
+        """Why the normalisation was safe to do: the deck never sees the indentation."""
+        from deckbuilder import budget, writer
+
+        raw = json.loads(self._text())
+        compacted = json.loads(json.dumps(raw, separators=(",", ":")))
+        self.assertEqual(
+            budget.frame_bytes(raw["rev"], raw),
+            budget.frame_bytes(raw["rev"], json.loads(writer.canonical(compacted))),
+        )
+
+    def test_the_layout_is_pure_ascii(self):
+        """Not style. The meter measures with ensure_ascii, and the file must agree.
+
+        A label containing `→` weighs six bytes on the wire and prints as one character here, so
+        the day this stops being true is the day the byte meter starts under-reporting — and
+        under-reporting is the failure mode the meter exists to prevent.
+        """
+        self._text().encode("ascii")  # raises, with the offending character, if it ever is not
+
+
 class DeckWriterTests(unittest.TestCase):
     """The theme builder rewrites deck.json, so it has to leave the rest of it alone.
 
-    A full json.dump would be correct and unreadable: it reflows the hand-written `seq` steps
-    under `pages` into twenty lines of diff for a one-colour change, and a tool whose diffs you
-    cannot read is one you stop trusting with the master copy. So the writer splices, and these
-    tests are the argument that the splice is safe — starting with the one that matters, which
-    is that rewriting an unchanged file changes nothing at all.
+    The writer used to splice, carrying everything from `"pages":` onward across byte for byte,
+    and these tests were the argument that the splice was safe. It owns pages now, so the
+    argument has changed shape but not subject: the file is rendered whole, and what has to be
+    proved is that rewriting an unchanged file changes nothing at all, and that a save cannot
+    touch a top-level key the writer does not own.
     """
 
     def _text(self) -> str:
@@ -1839,48 +2163,50 @@ class DeckWriterTests(unittest.TestCase):
         return (REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8")
 
     def _doc(self):
-        from deckbuilder.model import ThemeDoc
+        from deckbuilder.model import DeckDoc
 
-        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
 
-    def _tail(self, text: str) -> str:
+    def _build(self, original: str, **changes):
+        """Rebuilds the file from its own contents, with `changes` applied."""
         from deckbuilder import writer
 
-        return text[text.find(writer.ANCHOR.format(key="pages")):]
+        data = json.loads(original)
+        args = {key: json.loads(json.dumps(data[key])) for key in writer.OWNED}
+        args.update(changes)
+        return writer.build(original, **args)
 
     def test_rewriting_an_unchanged_file_is_byte_identical(self):
-        from deckbuilder import writer
-
+        """The acceptance test for the whole module: open, save, `git diff` is empty."""
         original = self._text()
-        data = json.loads(original)
-        result, spliced = writer.build(original, data["themes"], data["settings"], data["rev"])
+        result, reformatted = self._build(original)
 
-        self.assertTrue(spliced, "fell back to a full re-dump on the shipped file")
+        self.assertFalse(reformatted, "the shipped file is not in canonical form")
         self.assertEqual(result, original)
 
     def test_changing_a_colour_leaves_pages_untouched(self):
-        from deckbuilder import writer
-
         original = self._text()
         data = json.loads(original)
         themes = json.loads(json.dumps(data["themes"]))
         themes[0]["accent"] = "#ff0000"
 
-        result, spliced = writer.build(original, themes, data["settings"], data["rev"] + 1)
-        self.assertTrue(spliced)
-        self.assertEqual(self._tail(result), self._tail(original))
+        result, reformatted = self._build(original, themes=themes, rev=data["rev"] + 1)
+        self.assertFalse(reformatted)
+        # Semantic, not textual. The old writer proved this by comparing the tail of the file
+        # byte for byte, which it could only do while pages were a contiguous suffix it never
+        # rendered. Now they are rendered like everything else, so the claim worth making is
+        # that they still mean exactly what they meant.
+        self.assertEqual(json.loads(result)["pages"], data["pages"])
         self.assertEqual(json.loads(result)["themes"][0]["accent"], "#ff0000")
 
     def test_the_diff_is_only_the_lines_that_changed(self):
-        """The whole reason the splice exists, stated as a number."""
-        from deckbuilder import writer
-
+        """Why the file was normalised: a one-colour save is still a two-line diff."""
         original = self._text()
         data = json.loads(original)
         themes = json.loads(json.dumps(data["themes"]))
         themes[0]["accent"] = "#ff0000"
 
-        result, _ = writer.build(original, themes, data["settings"], data["rev"] + 1)
+        result, _ = self._build(original, themes=themes, rev=data["rev"] + 1)
         changed = [
             (a, b)
             for a, b in zip(original.splitlines(), result.splitlines())
@@ -1894,31 +2220,75 @@ class DeckWriterTests(unittest.TestCase):
         original = self._text()
         self.assertEqual(writer.newline_style(original), "\r\n", "fixture is no longer CRLF")
 
-        data = json.loads(original)
-        result, _ = writer.build(original, data["themes"], data["settings"], 99)
+        result, _ = self._build(original, rev=99)
         self.assertEqual(writer.newline_style(result), "\r\n")
         # Every LF belongs to a CRLF — no line was left half-converted.
         self.assertNotIn("\n", result.replace("\r\n", ""))
 
     def test_lf_files_stay_lf(self):
-        from deckbuilder import writer
-
         original = self._text().replace("\r\n", "\n")
-        data = json.loads(original)
-        result, spliced = writer.build(original, data["themes"], data["settings"], data["rev"])
-        self.assertTrue(spliced)
+        result, reformatted = self._build(original)
+        self.assertFalse(reformatted)
         self.assertEqual(result, original)
 
-    def test_a_reformatted_file_falls_back_rather_than_guessing(self):
+    def test_a_file_that_was_formatted_by_hand_says_so_before_the_diff_does(self):
+        """Saving normalises it. That is allowed, but it must never be a surprise."""
         from deckbuilder import writer
 
         original = json.dumps(json.loads(self._text()), indent=4) + "\n"
         data = json.loads(original)
-        result, spliced = writer.build(original, data["themes"], data["settings"], 42)
+        result, reformatted = self._build(original, rev=42)
 
-        self.assertFalse(spliced, "spliced a file it had no right to recognise")
+        self.assertTrue(reformatted, "reformatted the file without admitting it")
+        self.assertIn("reformatted", writer.SaveResult(Path("x"), 42, True).warning or "")
         self.assertEqual(json.loads(result)["rev"], 42)
         self.assertEqual(json.loads(result)["pages"], data["pages"])
+
+    def test_mixed_line_endings_are_never_claimed_to_survive(self):
+        from deckbuilder import writer
+
+        original = self._text().replace("\r\n", "\n", 5)
+        self.assertIsNone(writer.newline_style(original))
+        _result, reformatted = self._build(original)
+        self.assertTrue(reformatted)
+
+    def test_a_key_the_writer_does_not_own_comes_through_untouched(self):
+        """The honest successor to the old "the tail is unchanged" check.
+
+        A future firmware key has to survive a save it knows nothing about, wherever in the file
+        it sits — including before `pages`, which the splice could never have protected.
+        """
+        from deckbuilder import writer
+
+        data = json.loads(self._text())
+        spiked = {"schema": {"note": "not ours"}, **data, "trailing": [1, 2, 3]}
+        original = writer.canonical(spiked)
+
+        result, _ = self._build(original, rev=data["rev"] + 1)
+        written = json.loads(result)
+        self.assertEqual(written["schema"], {"note": "not ours"})
+        self.assertEqual(written["trailing"], [1, 2, 3])
+        self.assertEqual(list(written), list(spiked), "top-level keys were reordered")
+
+    def test_the_scope_guard_catches_a_writer_that_overreaches(self):
+        from deckbuilder import writer
+
+        before = {"rev": 1, "nav": {"macros": "x"}, "themes": [], "settings": {}, "pages": []}
+        writer.check_scope(before, dict(before, rev=2, themes=[{"name": "a"}]))
+
+        with self.assertRaises(writer.WriteError):
+            writer.check_scope(before, dict(before, nav={"macros": "y"}))
+        with self.assertRaises(writer.WriteError):
+            writer.check_scope(before, {k: v for k, v in before.items() if k != "nav"})
+        with self.assertRaises(writer.WriteError):
+            writer.check_scope(before, dict(sorted(before.items())))
+
+    def test_an_owned_key_the_file_never_had_may_be_appended(self):
+        """A deck.json with no pages at all gains one the first time a page is added."""
+        from deckbuilder import writer
+
+        before = {"rev": 1, "themes": [], "settings": {}}
+        writer.check_scope(before, dict(before, pages=[{"id": "home"}]))
 
     def test_the_written_file_still_loads(self):
         import tempfile
@@ -1930,7 +2300,10 @@ class DeckWriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "deck.json"
             path.write_bytes(self._text().encode("utf-8"))
-            writer.write(path, doc.themes, doc.settings, doc.next_rev())
+            writer.write(
+                path, themes=doc.themes, settings=doc.settings, pages=doc.pages,
+                rev=doc.next_rev(),
+            )
 
             reloaded = DeckConfig.load(path)  # validates, and raises if it cannot
             self.assertEqual(reloaded.rev, doc.next_rev())
@@ -1948,7 +2321,10 @@ class DeckWriterTests(unittest.TestCase):
             path.write_bytes(self._text().encode("utf-8"))
 
             doc = self._doc()
-            writer.write(path, doc.themes, doc.settings, 77, backup_dir=folder / "elsewhere")
+            writer.write(
+                path, themes=doc.themes, settings=doc.settings, pages=doc.pages, rev=77,
+                backup_dir=folder / "elsewhere",
+            )
 
             self.assertEqual(
                 sorted(p.name for p in folder.iterdir()), ["deck.json", "elsewhere"]
@@ -1975,9 +2351,9 @@ class ThemeShapeTests(unittest.TestCase):
     """
 
     def _doc(self):
-        from deckbuilder.model import ThemeDoc
+        from deckbuilder.model import DeckDoc
 
-        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
 
     def _reference(self) -> tuple:
         deck = json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8"))
@@ -2020,17 +2396,15 @@ class ThemeShapeTests(unittest.TestCase):
         doc.new_theme("Midnight")
         self.assertNotEqual(doc.themes[-1]["name"], "Midnight")
 
-    def test_the_writer_refuses_a_drifted_theme(self):
-        from deckbuilder import writer
+    def test_a_drifted_theme_is_refused_before_it_reaches_the_writer(self):
+        """The splice used to catch this by failing to regenerate the block.
 
+        Nothing structural catches it now — a dump will happily write a theme with a missing
+        key — so the guard has to be explicit, and it has to be the thing the save button reads.
+        """
         doc = self._doc()
         del doc.themes[0]["idle"]
-        with self.assertRaises(writer.WriteError):
-            writer.splice(
-                (REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"),
-                json.loads((REPO / "sdcard" / "deck.json").read_text(encoding="utf-8")),
-                doc.themes, doc.settings, 1,
-            )
+        self.assertTrue(doc.shape_problems())
 
     def test_renaming_follows_the_references(self):
         """A theme is referenced by name, and a stale name fails silently on the device."""
@@ -2042,14 +2416,24 @@ class ThemeShapeTests(unittest.TestCase):
         self.assertEqual(doc.problems(), [])
 
     def test_renaming_follows_theme_actions_including_nested_ones(self):
+        """Poked through `doc.pages`, which is the copy a save actually writes.
+
+        This test used to reach into `doc.raw["pages"]`, and would have gone on passing while
+        renaming quietly stopped following references — because `rename()` walked the same raw
+        dict the test was inspecting, rather than the list the document owns.
+        """
         doc = self._doc()
-        page = doc.raw["pages"][0]
+        page = next(p for p in doc.pages if p.get("buttons"))
         page["buttons"][0]["action"] = {
             "type": "seq",
             "steps": [{"type": "theme", "target": doc.themes[0]["name"]}],
         }
         doc.rename(0, "Elsewhere")
+
         self.assertEqual(page["buttons"][0]["action"]["steps"][0]["target"], "Elsewhere")
+        saved = doc.candidate_raw()["pages"]
+        self.assertEqual(saved[doc.pages.index(page)]["buttons"][0]["action"]["steps"][0]
+                         ["target"], "Elsewhere")
 
     def test_rev_bumps_only_when_something_changed(self):
         doc = self._doc()
@@ -2068,6 +2452,892 @@ class ThemeShapeTests(unittest.TestCase):
             doc.delete(0)
         with self.assertRaises(ModelError):
             doc.delete(0)
+
+
+class LayoutShapeTests(unittest.TestCase):
+    """Pages and buttons follow the rule themes already followed: one key set, one order.
+
+    ConfigShapeTests enforces it on what is committed; these enforce it on what the editor would
+    produce. The editor is about to start writing both, and the writer will no longer catch a
+    drifted shape structurally — a dump writes whatever it is handed.
+    """
+
+    def _doc(self):
+        from deckbuilder.model import DeckDoc
+
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
+
+    def _deck(self) -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"))
+
+    def test_the_hardcoded_orders_match_the_shipped_file(self):
+        from deckbuilder.model import BUTTON_FIELD_ORDER, PAGE_FIELD_ORDER
+
+        deck = self._deck()
+        first_button = next(
+            b for p in deck["pages"] for b in (p.get("buttons") or [])
+        )
+        self.assertEqual(PAGE_FIELD_ORDER, tuple(deck["pages"][0]))
+        self.assertEqual(BUTTON_FIELD_ORDER, tuple(first_button))
+
+    def test_the_templates_cover_every_field(self):
+        from deckbuilder.model import (
+            BUTTON_FIELD_ORDER,
+            BUTTON_TEMPLATE,
+            PAGE_FIELD_ORDER,
+            PAGE_TEMPLATE,
+        )
+
+        self.assertEqual(set(PAGE_TEMPLATE), set(PAGE_FIELD_ORDER))
+        self.assertEqual(set(BUTTON_TEMPLATE), set(BUTTON_FIELD_ORDER))
+
+    def test_the_shipped_file_has_no_shape_problems(self):
+        self.assertEqual(self._doc().shape_problems(), [])
+        self.assertEqual(self._doc().notices(), [])
+
+    def test_the_button_shape_comes_from_the_first_button_anywhere(self):
+        """A deck whose first page is the ten-key has no buttons on pages[0]."""
+        from deckbuilder.model import BUTTON_FIELD_ORDER, DeckDoc
+
+        deck = self._deck()
+        deck["pages"] = [p for p in deck["pages"] if p["id"] == "numpad"] + [
+            p for p in deck["pages"] if p["id"] != "numpad"
+        ]
+        doc = DeckDoc(
+            path=REPO / "sdcard" / "deck.json", original="", raw=deck,
+            themes=deck["themes"], settings=deck["settings"], pages=deck["pages"],
+            field_order=tuple(deck["themes"][0]),
+            page_order=tuple(deck["pages"][0]),
+            button_order=DeckDoc._order_of(DeckDoc._first_button(deck["pages"]), ()),
+        )
+        self.assertEqual(doc.button_order, BUTTON_FIELD_ORDER)
+
+    def test_a_pos_is_null_or_all_four_in_order(self):
+        doc = self._doc()
+        button = doc.pages[0]["buttons"][0]
+
+        button["pos"] = {"col": 1, "row": 0, "w": 1, "h": 1}
+        self.assertEqual(doc.shape_problems(), [])
+
+        button["pos"] = {"col": 1, "row": 0}
+        self.assertIn("pos must be null", " | ".join(doc.shape_problems()))
+
+        button["pos"] = {"row": 0, "col": 1, "w": 1, "h": 1}
+        self.assertIn("in that order", " | ".join(doc.shape_problems()))
+
+        button["pos"] = {"col": "1", "row": 0, "w": 1, "h": 1}
+        self.assertIn("pos.col is '1'", " | ".join(doc.shape_problems()))
+
+    def test_a_firmware_page_carrying_a_grid_or_buttons_is_caught(self):
+        """Both are parsed, ignored, and paid for in wire bytes forever."""
+        doc = self._doc()
+        numpad = next(p for p in doc.pages if p["type"] == "numpad")
+
+        numpad["grid"] = {"cols": 4, "rows": 3}
+        self.assertIn("grid should be null", " | ".join(doc.shape_problems()))
+
+        numpad["grid"] = None
+        numpad["buttons"] = [json.loads(json.dumps(doc.pages[0]["buttons"][0]))]
+        self.assertIn("never built", " | ".join(doc.shape_problems()))
+
+    def test_a_drifted_first_button_is_reported_rather_than_adopted_in_silence(self):
+        """The hole in shape_problems(): it compares against the order derived from the file."""
+        from deckbuilder.model import DeckDoc
+
+        deck = self._deck()
+        for page in deck["pages"]:
+            for button in page.get("buttons") or []:
+                button["stat"] = None
+
+        doc = DeckDoc(
+            path=REPO / "sdcard" / "deck.json", original="", raw=deck,
+            themes=deck["themes"], settings=deck["settings"], pages=deck["pages"],
+            field_order=tuple(deck["themes"][0]),
+            page_order=tuple(deck["pages"][0]),
+            button_order=DeckDoc._order_of(DeckDoc._first_button(deck["pages"]), ()),
+        )
+
+        # Adopted, so a new firmware field needs no change here...
+        self.assertEqual(doc.shape_problems(), [])
+        # ...but said out loud, because the other way to get here is a bad hand edit.
+        self.assertIn("extra: stat", " | ".join(doc.notices()))
+
+
+class GridGeometryTests(unittest.TestCase):
+    """The preview has to place tiles exactly where ui_builder.cpp would, including the edges.
+
+    `col >= cols` has no firmware log at all — the tile is created at its computed x and simply
+    extends past the 800px edge — so a hole in this arithmetic shows up on the deck as a tile
+    that is not there, with nothing anywhere saying why.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+
+    def _deck(self) -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"))
+
+    def test_the_grid_fallback_matches_the_firmware(self):
+        from deckbuilder.render import grid_size
+
+        source = (REPO / "firmware" / "multi_deck" / "ui_builder.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(source, r"cols\s*>\s*0\s*\?\s*.*?cols\s*:\s*4")
+        self.assertRegex(source, r"rows\s*>\s*0\s*\?\s*.*?rows\s*:\s*3")
+
+        self.assertEqual(grid_size({"cols": 5, "rows": 4}), (5, 4))
+        self.assertEqual(grid_size({"cols": 0, "rows": 0}), (4, 3))
+        self.assertEqual(grid_size({"cols": -2, "rows": -1}), (4, 3))
+        self.assertEqual(grid_size({"cols": None, "rows": None}), (4, 3))
+        self.assertEqual(grid_size(None), (4, 3))
+
+    def test_a_null_pos_with_a_span_renders(self):
+        """Legal on the device — ArduinoJson's `|` treats null and absent alike — and it used
+        to crash the preview with `None < 0`."""
+        from deckbuilder import render
+
+        deck = self._deck()
+        deck["pages"][0]["buttons"][0]["pos"] = {"col": None, "row": None, "w": 2, "h": 1}
+        preview = render.render_page(
+            deck, deck["themes"][0], "launch", asset_root=REPO / "sdcard"
+        )
+        self.assertEqual(preview.warnings, [])
+
+    def test_the_pos_fields_are_read_the_way_arduinojson_reads_them(self):
+        from deckbuilder.render import _int_or
+
+        source = (REPO / "firmware" / "multi_deck" / "deck_config.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('pos["col"] | -1', source)
+        self.assertIn('pos["w"] | 1', source)
+
+        self.assertEqual(_int_or(None, -1), -1)
+        self.assertEqual(_int_or("2", -1), -1)
+        self.assertEqual(_int_or(True, -1), -1)
+        self.assertEqual(_int_or(0, -1), 0)
+        self.assertEqual(_int_or(3, -1), 3)
+
+    def test_a_tile_that_spans_off_the_grid_is_reported(self):
+        from deckbuilder import render
+
+        deck = self._deck()
+        deck["pages"][0]["buttons"][0]["pos"] = {"col": 3, "row": 0, "w": 2, "h": 1}
+        preview = render.render_page(
+            deck, deck["themes"][0], "launch", asset_root=REPO / "sdcard"
+        )
+        self.assertIn("past the 4-column grid", " | ".join(preview.warnings))
+
+    def test_the_nav_bar_draws_what_the_firmware_draws(self):
+        """The firmware creates every tab and lets the container clip it; this used to break.
+
+        Which made the preview look clean at exactly the point the deck becomes unusable.
+        """
+        from deckbuilder import render
+
+        source = (REPO / "firmware" / "multi_deck" / "ui_builder.cpp").read_text(
+            encoding="utf-8"
+        )
+        nav = re.search(r"void buildNav.*?\n\}", source, re.S)
+        self.assertIsNotNone(nav, "could not find buildNav in ui_builder.cpp")
+        self.assertNotIn("break", nav.group(0), "the firmware now stops early; so should we")
+
+        deck = self._deck()
+        spare = json.loads(json.dumps(deck["pages"][-1]))
+        for index in range(2):
+            extra = json.loads(json.dumps(spare))
+            extra["id"], extra["title"] = f"extra{index}", f"Extra {index}"
+            deck["pages"].append(extra)
+
+        preview = render.render_page(
+            deck, deck["themes"][0], "launch", asset_root=REPO / "sdcard"
+        )
+        self.assertIn("cut off at the edge", " | ".join(preview.warnings))
+
+    def test_six_tabs_fit_and_the_seventh_does_not(self):
+        from deckbuilder import render
+
+        fits = [
+            index
+            for index in range(10)
+            if render.PAD + index * render.TAB_STEP + render.TAB_W <= render.SCREEN_W
+        ]
+        self.assertEqual(len(fits), 6)
+
+
+class AutoFlowTests(unittest.TestCase):
+    """Where tiles land, and the one line of it that surprises everybody.
+
+    `flow++` fires only in the auto branch (ui_builder.cpp:409-413), so a pinned tile consumes no
+    slot and every auto tile after it shifts back one. That is why the editor pins a whole page at
+    a time and never a single tile — and the strongest statement available about pin_all is that
+    it changes no placement at all.
+    """
+
+    def _doc(self):
+        from deckbuilder.model import DeckDoc
+
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
+
+    def test_pinning_a_page_moves_nothing(self):
+        from deckbuilder import geometry
+
+        doc = self._doc()
+        grids = [i for i, p in enumerate(doc.pages) if p.get("type") == "grid"]
+        before = {p["id"]: geometry.auto_flow(p) for p in doc.pages}
+
+        for index in grids:
+            doc.pin_all(index)
+
+        self.assertEqual({p["id"]: geometry.auto_flow(p) for p in doc.pages}, before)
+        for index in grids:
+            self.assertTrue(doc.is_pinned(index))
+
+    def test_unpinning_returns_the_file_to_where_it_started(self):
+        doc = self._doc()
+        before = json.dumps(doc.pages)
+        doc.pin_all(0)
+        doc.unpin_all(0)
+        self.assertEqual(json.dumps(doc.pages), before)
+
+    def test_pinning_one_tile_in_place_moves_the_others(self):
+        """The measurement the whole Auto/Fixed design falls out of."""
+        from deckbuilder import geometry
+
+        doc = self._doc()
+        page = doc.pages[0]
+        before = geometry.auto_flow(page)
+
+        # Pin the fourth tile exactly where auto-flow already put it.
+        _id, col, row, _w, _h = before[3]
+        page["buttons"][3]["pos"] = {"col": col, "row": row, "w": 1, "h": 1}
+
+        after = geometry.auto_flow(page)
+        moved = [b for b, a in zip(before, after) if b != a]
+        self.assertEqual(len(moved), len(before) - 4, moved)
+
+    def test_pinning_a_page_costs_what_the_plan_measured(self):
+        from deckbuilder import budget
+
+        doc = self._doc()
+        before = budget.frame_bytes(doc.rev, doc.candidate_raw())
+        for index, page in enumerate(doc.pages):
+            if page.get("type") == "grid":
+                doc.pin_all(index)
+
+        after = budget.frame_bytes(doc.rev, doc.candidate_raw())
+        # Not pinned to 600 exactly — the layout is allowed to grow. Pinned to the shape of the
+        # trade: it is hundreds of bytes, which is why it is opt-in and states its price first.
+        self.assertGreater(after - before, 400)
+        self.assertLess(after, budget.LIMIT)
+
+    def test_the_inverse_of_the_grid_is_exactly_the_grid(self):
+        """Every cell of every plausible grid, because a hole here is a tile that is not there."""
+        from deckbuilder import geometry
+
+        for cols in range(1, 9):
+            for rows in range(1, 7):
+                cell_w, cell_h = geometry.cells(cols, rows)
+                if cell_w <= 0 or cell_h <= 0:
+                    continue
+                for col in range(cols):
+                    for row in range(rows):
+                        x0, y0, x1, y1 = geometry.tile_box(col, row, 1, 1, cell_w, cell_h)
+                        with self.subTest(grid=f"{cols}x{rows}", cell=f"{col},{row}"):
+                            self.assertEqual(geometry.cell_at(x0, y0, cols, rows), (col, row))
+                            self.assertEqual(
+                                geometry.cell_at(x1 - 1, y1 - 1, cols, rows), (col, row)
+                            )
+
+    def test_the_gutters_belong_to_no_cell(self):
+        """A drag released in the padding reports nothing rather than guessing at the near side."""
+        from deckbuilder import geometry
+
+        cols, rows = 4, 3
+        cell_w, cell_h = geometry.cells(cols, rows)
+        x0, y0, x1, _y1 = geometry.tile_box(0, 0, 1, 1, cell_w, cell_h)
+
+        self.assertIsNone(geometry.cell_at(x0 - 1, y0, cols, rows))
+        self.assertIsNone(geometry.cell_at(x1, y0, cols, rows))  # first pixel of the gutter
+        self.assertIsNone(geometry.cell_at(x0, geometry.NAV_H // 2, cols, rows))  # the nav bar
+        self.assertIsNone(geometry.cell_at(geometry.SCREEN_W - 1, y0, cols, rows))
+
+    def test_the_nav_bar_capacity_is_six(self):
+        from deckbuilder import geometry
+
+        self.assertEqual(geometry.nav_capacity(), 6)
+        # The seventh starts inside the screen and ends past it, which is the case worth naming:
+        # it is drawn, clipped, and cannot be pressed.
+        seventh = geometry.PAD + 6 * geometry.TAB_STEP
+        self.assertLess(seventh, geometry.SCREEN_W)
+        self.assertGreater(seventh + geometry.TAB_W, geometry.SCREEN_W)
+
+
+class PreviewFeedbackTests(unittest.TestCase):
+    """The preview reports what it drew, so a click can be turned back into a tile."""
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+
+    def _deck(self) -> dict:
+        return json.loads((REPO / "sdcard" / "deck.json").read_bytes().decode("utf-8"))
+
+    def _render(self, deck: dict, page_id: str = "launch"):
+        from deckbuilder import render
+
+        return render.render_page(
+            deck, deck["themes"][0], page_id, asset_root=REPO / "sdcard"
+        )
+
+    def test_every_drawn_tile_is_reported_with_its_box(self):
+        deck = self._deck()
+        page = next(p for p in deck["pages"] if p["id"] == "launch")
+        preview = self._render(deck)
+
+        self.assertEqual(list(preview.boxes), [b["id"] for b in page["buttons"]])
+        self.assertEqual(preview.cell, (4, 3))
+
+    def test_a_hit_test_finds_the_tile_under_the_point(self):
+        deck = self._deck()
+        preview = self._render(deck)
+
+        for button_id, (x0, y0, x1, y1) in preview.boxes.items():
+            with self.subTest(button=button_id):
+                self.assertEqual(preview.at((x0 + x1) // 2, (y0 + y1) // 2), button_id)
+
+        self.assertIsNone(preview.at(2, 2), "the nav bar is not a tile")
+
+    def test_the_topmost_tile_wins_an_overlap(self):
+        """LVGL z-order is creation order, so the later tile is the one you would press."""
+        deck = self._deck()
+        page = next(p for p in deck["pages"] if p["id"] == "launch")
+
+        # The last cell of the 4x3 grid, which auto-flow does not reach: pinning these two frees
+        # their slots, so the ten remaining tiles fill (0,0) through (1,2) and stop.
+        page["buttons"][0]["pos"] = {"col": 3, "row": 2, "w": 1, "h": 1}
+        page["buttons"][1]["pos"] = {"col": 3, "row": 2, "w": 1, "h": 1}
+
+        preview = self._render(deck)
+        box = preview.boxes[page["buttons"][1]["id"]]
+        self.assertEqual(
+            preview.at((box[0] + box[2]) // 2, (box[1] + box[3]) // 2),
+            page["buttons"][1]["id"],
+        )
+
+    def test_placement_says_where_auto_flow_actually_put_things(self):
+        from deckbuilder import geometry
+
+        deck = self._deck()
+        page = next(p for p in deck["pages"] if p["id"] == "launch")
+        preview = self._render(deck)
+
+        self.assertEqual(
+            [(k, *v) for k, v in preview.placed.items()], geometry.auto_flow(page)
+        )
+
+    def test_a_tile_the_firmware_would_not_build_is_named_rather_than_missing(self):
+        deck = self._deck()
+        page = next(p for p in deck["pages"] if p["id"] == "launch")
+        page["buttons"][2]["pos"] = {"col": 0, "row": 9, "w": 1, "h": 1}
+
+        preview = self._render(deck)
+        self.assertEqual(preview.skipped, [page["buttons"][2]["id"]])
+        self.assertNotIn(page["buttons"][2]["id"], preview.boxes)
+
+    def test_a_page_that_is_not_a_grid_reports_no_cells(self):
+        preview = self._render(self._deck(), "numpad")
+        self.assertIsNone(preview.cell)
+        self.assertEqual(preview.boxes, {})
+
+
+class ButtonFormTests(unittest.TestCase):
+    """The action editor must never quietly drop a key it does not understand."""
+
+    def test_every_action_type_is_either_modelled_or_deliberately_not(self):
+        from deckbuilder.button_form import KNOWN_KEYS, SIMPLE_FIELDS
+        from deckhost.config import ACTION_TYPES
+
+        self.assertEqual(set(KNOWN_KEYS), set(ACTION_TYPES))
+        # seq is the one type with no simple row: its payload is a list of actions, and a
+        # nested list-of-forms would be most of the work of the whole panel.
+        self.assertEqual(set(ACTION_TYPES) - set(SIMPLE_FIELDS), {"seq"})
+
+    def test_the_required_field_is_the_one_the_row_edits(self):
+        """Otherwise the form can build an action the validator immediately rejects."""
+        from deckbuilder.button_form import SIMPLE_FIELDS
+        from deckhost.config import ACTION_REQUIRED
+
+        for kind, required in ACTION_REQUIRED.items():
+            if kind not in SIMPLE_FIELDS:
+                continue
+            with self.subTest(type=kind):
+                self.assertEqual(SIMPLE_FIELDS[kind][0], required)
+
+    def test_the_known_keys_cover_what_the_firmware_and_agent_read(self):
+        source = (REPO / "firmware" / "multi_deck" / "deck_config.cpp").read_text(
+            encoding="utf-8"
+        )
+        from deckbuilder.button_form import KNOWN_KEYS
+
+        # Scoped to parseActionJson: parseTheme reads `src["bg"]` and friends out of a different
+        # kind of object entirely, and the whole file would drag all seventeen theme tokens in.
+        body = re.search(r"void parseActionJson\(.*?\n\}", source, re.S)
+        self.assertIsNotNone(body, "could not find parseActionJson in deck_config.cpp")
+        parsed = set(re.findall(r'src\["(\w+)"\]', body.group(0)))
+        self.assertIn("keys", parsed, "the regex stopped matching what the firmware reads")
+        modelled = set().union(*KNOWN_KEYS.values())
+        self.assertTrue(
+            parsed <= modelled,
+            f"parseActionJson reads {sorted(parsed - modelled)}, which no form row models",
+        )
+
+
+class WindowTests(unittest.TestCase):
+    """The two things that only go wrong once a real event loop is running.
+
+    Every other test in this file drives the editor's objects directly, which is fast and covers
+    the logic — and is exactly why both of these shipped. One needs Tk to deliver a queued
+    virtual event; the other needs a font to be measured.
+    """
+
+    def setUp(self):
+        try:
+            import tkinter as tk
+
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("tkinter or Pillow not installed")
+
+        try:
+            self.root = tk.Tk()
+        except tk.TclError:
+            self.skipTest("no display")
+
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+
+        import shutil
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        self.deck = Path(tmp) / "sdcard"
+        shutil.copytree(REPO / "sdcard", self.deck)
+
+    def _app(self):
+        from deckbuilder.app import BuilderApp
+
+        return BuilderApp(self.root, self.deck / "deck.json")
+
+    def test_rows_are_tall_enough_for_the_text_in_them(self):
+        """ttk's rowheight does not follow its font: it defaults to 20 and stays there.
+
+        At any readable point size that clips the text into a smear. It is also the whole of the
+        hit-testing bug that came with it — ttk lays rows out *and* identifies them from
+        rowheight, so while the two disagreed, the row you clicked was not the row you could see.
+        Asserted here rather than by clicking, because a click needs a mapped window and a test
+        suite that flashes windows is one you stop running.
+        """
+        import tkinter.font as tkfont
+        from tkinter import ttk
+
+        app = self._app()
+        style = ttk.Style()
+
+        for points in (11, 12, 14, 18):
+            with self.subTest(points=points):
+                app._style(points)
+                line = tkfont.Font(font=("Segoe UI", points)).metrics("linespace")
+                self.assertGreaterEqual(int(style.lookup("Treeview", "rowheight")), line)
+
+    def test_selecting_a_row_settles_instead_of_refreshing_forever(self):
+        """<<TreeviewSelect>> arrives queued, not only synchronously.
+
+        Rebuilding the tree restores the selection, which fires the event *after* the rebuild
+        has returned — so a flag cleared at the end of the rebuild does not stop it, and the
+        result is an endless refresh loop with a stack eight frames deep. It pins the CPU rather
+        than raising, and looks like a crash from the outside.
+        """
+        app = self._app()
+        panel = app.layout_panel
+
+        calls = []
+        original = app.refresh
+        app.refresh = lambda **kw: (calls.append(1), original(**kw))[1]
+
+        panel.tree.selection_set("button:0:1")
+        panel.tree.focus("button:0:1")
+
+        # Each update() drains the queue once. A live loop re-arms it every time, so the count
+        # keeps climbing; a settled one stops. Bounded either way, so the test cannot hang.
+        for _ in range(6):
+            self.root.update()
+        settled = len(calls)
+        for _ in range(6):
+            self.root.update()
+
+        self.assertEqual(len(calls), settled, "selecting a row keeps re-refreshing the window")
+        self.assertLess(settled, 4, f"one selection caused {settled} refreshes")
+
+    def test_a_selection_reaches_the_panels_that_follow_it(self):
+        app = self._app()
+        panel = app.layout_panel
+
+        panel.select_button(0, 3)
+        self.root.update()
+
+        self.assertEqual(panel.selection(), ("button", 0, 3))
+        self.assertIs(panel.button_form.button, app.doc.pages[0]["buttons"][3])
+        self.assertEqual(app.page_var.get(), app.doc.pages[0]["title"])
+
+
+class PageOperationTests(unittest.TestCase):
+    """Pages and buttons are references as much as objects, so editing one edits the others."""
+
+    def _doc(self):
+        from deckbuilder.model import DeckDoc
+
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
+
+    def test_renaming_a_page_follows_every_nav_button(self):
+        doc = self._doc()
+        index = doc.page_index("macros")
+        self.assertTrue(doc.page_referrers("macros"))
+
+        doc.rename_page_id(index, "macro.pad")
+        self.assertEqual(doc.page_referrers("macros"), [])
+        self.assertTrue(doc.page_referrers("macro.pad"))
+        self.assertEqual(doc.problems(), [])
+
+    def test_deleting_a_referenced_page_refuses_and_names_the_referrers(self):
+        """Silently repointing somebody's nav tile would lose the only clue about its purpose."""
+        from deckbuilder.model import ModelError
+
+        doc = self._doc()
+        with self.assertRaises(ModelError) as caught:
+            doc.delete_page(doc.page_index("macros"))
+        self.assertIn("nav.macros", str(caught.exception))
+
+    def test_a_duplicated_page_points_at_itself(self):
+        doc = self._doc()
+        source = doc.pages[0]["id"]
+        doc.pages[0]["buttons"][0]["action"] = {"type": "page", "target": source}
+
+        index = doc.duplicate_page(0)
+        copied = doc.pages[index]
+        self.assertNotEqual(copied["id"], source)
+        self.assertEqual(copied["buttons"][0]["action"]["target"], copied["id"])
+        self.assertEqual(doc.shape_problems(), [])
+        self.assertEqual(doc.problems(), [])
+
+    def test_new_ids_are_unique_and_carry_no_spaces(self):
+        doc = self._doc()
+        doc.new_page("Launch")
+        doc.new_button(0, "VS Code")
+
+        ids = [p["id"] for p in doc.pages] + sorted(doc.button_ids())
+        self.assertEqual(len(ids), len(set(ids)))
+        for value in ids:
+            with self.subTest(id=value):
+                self.assertNotIn(" ", value)
+
+    def test_moving_a_button_between_pages_drops_its_position(self):
+        """A pin is page-local: (3,2) on a 4x3 grid is off the edge of a 3x2 one."""
+        doc = self._doc()
+        doc.pin_all(0)
+        moved = doc.pages[0]["buttons"][5]["id"]
+
+        doc.move_button_to_page(0, 5, 1)
+        landed = doc.pages[1]["buttons"][-1]
+        self.assertEqual(landed["id"], moved)
+        self.assertIsNone(landed["pos"])
+
+    def test_a_firmware_page_refuses_buttons_and_a_grid(self):
+        from deckbuilder.model import ModelError
+
+        doc = self._doc()
+        numpad = doc.page_index("numpad")
+        with self.assertRaises(ModelError):
+            doc.set_grid(numpad, 4, 3)
+        with self.assertRaises(ModelError):
+            doc.move_button_to_page(0, 0, numpad)
+
+    def test_the_shipped_layout_has_no_geometry_problems(self):
+        self.assertEqual(self._doc().layout_problems(), [])
+
+    def test_overlapping_pins_are_caught(self):
+        doc = self._doc()
+        doc.pin_all(0)
+        doc.pages[0]["buttons"][1]["pos"] = dict(doc.pages[0]["buttons"][0]["pos"])
+        self.assertIn("overlaps", " | ".join(doc.layout_problems()))
+
+    def test_a_grid_too_fine_to_press_is_caught(self):
+        from deckbuilder import geometry
+        from deckbuilder.model import MIN_TILE_PX
+
+        # 8x6 is 91x61px, which squeaks past — the threshold is drawn at roughly a fingertip on
+        # a 7" panel, and being close to it is not the same as being over it.
+        self.assertGreaterEqual(min(geometry.cells(8, 6)), MIN_TILE_PX)
+
+        doc = self._doc()
+        doc.set_grid(0, 8, 7)
+        self.assertIn("fingertip", " | ".join(doc.layout_problems()))
+
+    def test_more_pages_than_the_nav_holds_is_caught(self):
+        doc = self._doc()
+        while len(doc.pages) <= 6:
+            doc.new_page(f"Spare {len(doc.pages)}")
+        self.assertIn("cannot be reached", " | ".join(doc.layout_problems()))
+
+    def test_the_boot_page_is_named_so_a_reorder_can_mention_it(self):
+        doc = self._doc()
+        self.assertEqual(doc.boot_page, doc.pages[0]["id"])
+        doc.move_page(1, -1)
+        self.assertEqual(doc.boot_page, doc.pages[0]["id"])
+
+
+class LibraryTests(unittest.TestCase):
+    """Parking something has to be reversible, or nobody will use it on anything they care about."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+        import shutil
+
+        self.root = self.tmp / "sdcard"
+        shutil.copytree(REPO / "sdcard", self.root)
+
+    def _doc(self):
+        from deckbuilder.model import DeckDoc
+
+        return DeckDoc.load(self.root / "deck.json")
+
+    def test_a_parked_page_comes_back_identical(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        before = json.loads(json.dumps(doc.pages[doc.page_index("calendar")]))
+
+        path, freed = library.park(
+            doc, "page", [doc.page_index("calendar")], self.tmp / "calendar.mdpart.json"
+        )
+        self.assertGreater(freed, 0)
+        self.assertNotIn("calendar", [p["id"] for p in doc.pages])
+
+        plan = library.plan_import(doc, library.read(path))
+        self.assertEqual(plan.problems, [])
+        library.apply(doc, plan)
+
+        self.assertEqual(doc.pages[doc.page_index("calendar")], before)
+        self.assertEqual(doc.shape_problems(), [])
+        self.assertEqual(doc.problems(), [])
+
+    def test_nothing_is_removed_until_the_file_reads_back(self):
+        """The ordering that makes park safe to use on something you cannot rebuild."""
+        import ast
+
+        source = (REPO / "agent" / "deckbuilder" / "library.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        park = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "park"
+        )
+        calls = [
+            node.func.id
+            for node in ast.walk(park)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        self.assertLess(calls.index("export"), calls.index("read"))
+        self.assertLess(calls.index("read"), calls.index("_remove"))
+
+    def test_parking_a_referenced_page_refuses_and_keeps_the_file(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = self.tmp / "macros.mdpart.json"
+        with self.assertRaises(library.LibraryError) as caught:
+            library.park(doc, "page", [doc.page_index("macros")], path)
+
+        self.assertIn("nothing was removed", str(caught.exception))
+        self.assertTrue(path.is_file(), "the copy was written and must not be thrown away")
+        self.assertIn("macros", [p["id"] for p in doc.pages])
+
+    def test_importing_the_same_thing_twice_uniques_rather_than_collides(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "theme", [0], self.tmp / "one.mdpart.json")
+        fragment = library.read(path)
+
+        for _ in range(2):
+            plan = library.plan_import(doc, fragment)
+            library.apply(doc, plan)
+
+        names = [t["name"] for t in doc.themes]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(doc.problems(), [])
+
+    def test_a_whole_deck_is_a_valid_source(self):
+        """Which is what makes the backup folder an undo-across-sessions."""
+        from deckbuilder import library
+
+        fragment = library.read(self.root / "deck.json")
+        self.assertEqual(fragment.source, "deck")
+        self.assertEqual(fragment.kind, "theme")
+
+        raw = json.loads((self.root / "deck.json").read_bytes().decode("utf-8"))
+        as_pages = library.pick(fragment, "page", raw)
+        self.assertEqual([p["id"] for p in as_pages.items], [p["id"] for p in raw["pages"]])
+
+    def test_a_newer_item_is_refused_rather_than_quietly_trimmed(self):
+        """Dropping a key the firmware reads changes behaviour, silently, on the deck."""
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "theme", [0], self.tmp / "one.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["items"][0]["glow"] = 40
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        plan = library.plan_import(doc, library.read(path))
+        self.assertFalse(plan.ok)
+        self.assertIn("glow", " | ".join(plan.problems))
+
+    def test_an_older_item_is_filled_in_and_said_so(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "theme", [0], self.tmp / "one.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["items"][0]["dim_opa"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        plan = library.plan_import(doc, library.read(path))
+        self.assertTrue(plan.ok)
+        self.assertIn("dim_opa", " | ".join(plan.notes))
+        self.assertIsNone(plan.items[0]["dim_opa"], "must default to config.h, not to a literal")
+        self.assertEqual(tuple(plan.items[0]), doc.field_order)
+
+    def test_the_cost_is_known_before_anything_is_committed(self):
+        """Import is where the budget actually gets blown."""
+        from deckbuilder import budget, library
+
+        doc = self._doc()
+        path = library.export(doc, "page", [0], self.tmp / "page.mdpart.json")
+        plan = library.plan_import(doc, library.read(path))
+
+        before = budget.frame_bytes(doc.next_rev(), doc.candidate_raw())
+        library.apply(doc, plan)
+        after = budget.frame_bytes(doc.next_rev(), doc.candidate_raw())
+
+        self.assertEqual(plan.bytes_delta, after - before)
+        self.assertEqual(plan.used_after, after)
+
+    def test_a_missing_wallpaper_is_reported_before_the_import_lands(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        fragment = library.read(self.root / "deck.json")
+        fragment.items = [dict(fragment.items[0], name="Ghost", wallpaper="/wall/absent.bin")]
+
+        plan = library.plan_import(doc, fragment)
+        self.assertEqual(plan.missing_assets, ["/wall/absent.bin"])
+
+    def test_the_manifest_describes_assets_rather_than_carrying_them(self):
+        """A wallpaper is 768KB, and the file's virtue is that you can open and read it."""
+        from deckbuilder import library
+
+        doc = self._doc()
+        themed = next(
+            (i for i, t in enumerate(doc.themes) if (t.get("wallpaper") or "").startswith("/")),
+            None,
+        )
+        if themed is None:
+            self.skipTest("no theme in the shipped deck uses a wallpaper")
+
+        path = library.export(doc, "theme", [themed], self.tmp / "wall.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(data["assets"])
+        entry = data["assets"][0]
+        self.assertEqual(set(entry), {"path", "sha256", "bytes"})
+        self.assertLess(path.stat().st_size, 32_000, "the manifest turned into a payload")
+
+    def test_a_button_loses_a_pin_it_cannot_honour(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        doc.pin_all(0)
+        path = library.export(doc, "button", [3], self.tmp / "one.mdpart.json", page_index=0)
+
+        plan = library.plan_import(doc, library.read(path), into_page=1)
+        self.assertIsNone(plan.items[0]["pos"])
+        self.assertIn("dropped its fixed position", " | ".join(plan.notes))
+
+    def test_a_page_keeps_pins_that_came_with_their_grid(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        doc.pin_all(0)
+        expected = json.loads(json.dumps(doc.pages[0]["buttons"][0]["pos"]))
+
+        path = library.export(doc, "page", [0], self.tmp / "page.mdpart.json")
+        plan = library.plan_import(doc, library.read(path))
+        self.assertEqual(plan.items[0]["buttons"][0]["pos"], expected)
+
+    def test_a_dangling_nav_target_is_named_at_import_time(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "page", [0], self.tmp / "page.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["items"][0]["buttons"][0]["action"] = {"type": "page", "target": "nowhere"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        plan = library.plan_import(doc, library.read(path))
+        self.assertIn("nowhere", " | ".join(plan.notes))
+
+    def test_a_file_that_is_neither_is_refused_by_name(self):
+        from deckbuilder import library
+
+        path = self.tmp / "random.json"
+        path.write_text('{"hello": 1}', encoding="utf-8")
+        with self.assertRaises(library.LibraryError):
+            library.read(path)
+
+    def test_a_future_format_version_is_refused(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "theme", [0], self.tmp / "one.mdpart.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["multi_deck"] = 99
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(library.LibraryError):
+            library.read(path)
+
+    def test_a_parked_file_says_where_it_came_from(self):
+        from deckbuilder import library
+
+        doc = self._doc()
+        path = library.export(doc, "button", [2], self.tmp / "one.mdpart.json", page_index=0)
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(data["from"]["rev"], doc.rev)
+        self.assertEqual(data["origin"]["page"], doc.pages[0]["id"])
+        self.assertEqual(data["kind"], "button")
 
 
 class ByteBudgetTests(unittest.TestCase):
@@ -2121,8 +3391,56 @@ class ByteBudgetTests(unittest.TestCase):
     def test_the_shipped_layout_is_not_already_warning(self):
         from deckbuilder import budget
 
+        # The property, not the enum it currently produces. Asserting "near" would start failing
+        # for a layout that got *smaller*, which is not a regression in anything.
         raw = self._raw()
-        self.assertEqual(budget.report(raw["rev"], raw).level, "near")
+        report = budget.report(raw["rev"], raw)
+        self.assertLess(report.used, report.warn_at)
+
+    def test_the_meter_measures_the_same_way_the_encoder_does(self):
+        """The mismatch that made this under-report: ensure_ascii, set two different ways."""
+        from deckbuilder import budget
+
+        raw = self._raw()
+        before = budget.frame_bytes(raw["rev"], raw)
+        theme = json.loads(json.dumps(raw["themes"][0]))
+        theme["name"] = "Café"
+
+        raw["themes"].append(theme)
+        self.assertEqual(before + budget.item_cost(theme), budget.frame_bytes(raw["rev"], raw))
+
+    def test_a_page_costs_what_the_meter_says_it_costs(self):
+        from deckbuilder import budget
+
+        raw = self._raw()
+        before = budget.frame_bytes(raw["rev"], raw)
+        page = json.loads(json.dumps(raw["pages"][0]))
+        page["id"] = "copy"
+
+        raw["pages"].append(page)
+        self.assertEqual(before + budget.page_cost(page), budget.frame_bytes(raw["rev"], raw))
+
+    def test_removing_something_is_measured_rather_than_estimated(self):
+        """The number that appears next to a button someone is about to press."""
+        from deckbuilder import budget
+
+        raw = self._raw()
+        freed = budget.removal_cost(raw["rev"], raw, lambda after: after["pages"].pop(0))
+
+        after = json.loads(json.dumps(raw))
+        after["pages"].pop(0)
+        self.assertEqual(
+            freed, budget.frame_bytes(raw["rev"], raw) - budget.frame_bytes(raw["rev"], after)
+        )
+        self.assertGreater(freed, 0)
+
+    def test_removal_cost_does_not_disturb_the_layout_it_measures(self):
+        from deckbuilder import budget
+
+        raw = self._raw()
+        untouched = json.dumps(raw)
+        budget.removal_cost(raw["rev"], raw, lambda after: after["pages"].clear())
+        self.assertEqual(json.dumps(raw), untouched)
 
 
 class BuilderIconTests(unittest.TestCase):
@@ -2161,16 +3479,16 @@ class PreviewRenderTests(unittest.TestCase):
             self.skipTest("Pillow not installed")
 
     def _doc(self):
-        from deckbuilder.model import ThemeDoc
+        from deckbuilder.model import DeckDoc
 
-        return ThemeDoc.load(REPO / "sdcard" / "deck.json")
+        return DeckDoc.load(REPO / "sdcard" / "deck.json")
 
     def test_every_shipped_theme_and_page_renders(self):
         from deckbuilder import render
 
         doc = self._doc()
         for theme in doc.themes:
-            for page in doc.raw["pages"]:
+            for page in doc.pages:
                 with self.subTest(theme=theme["name"], page=page["id"]):
                     preview = render.render_page(
                         doc.candidate_raw(), theme, page["id"],

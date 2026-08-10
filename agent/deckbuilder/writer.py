@@ -1,47 +1,44 @@
-"""Writes themes and settings back into deck.json without touching anything else.
+"""Writes the layout back into deck.json.
 
-The obvious implementation is `json.dump(data, indent=2)`, and it is wrong here. deck.json is
-hand-maintained and contains hand-formatting a dump does not reproduce — the `seq` action steps
-are written one per line on purpose, and a full re-dump explodes them into twenty-odd lines of
-diff for a change that touched one colour. A tool whose diffs you cannot read is a tool you stop
-trusting with the file.
+This module used to splice. It re-serialised `rev`, `themes` and `settings`, and carried
+everything from `"pages":` onward across byte for byte, so that changing one colour did not
+reformat a file that was hand-maintained — the `seq` action steps were written one per line on
+purpose, and a full re-dump exploded them into twenty-odd lines of diff.
 
-So this splices. It re-serialises only `rev`, `themes` and `settings`, and carries everything
-from `"pages":` onward across byte for byte.
+That trade stopped paying when the editor learned to edit pages. The splice worked by
+regenerating a block and comparing it to the file, which is a genuinely good check, but it can
+only cover blocks the editor does not own. Owning `pages` too leaves `rev` and the braces, and
+"regenerate everything, compare it to the file, then write the regenerated version" is a full
+dump with extra steps. The old docstring named this exit condition itself: if the fallback ever
+fires in normal use, delete the splice rather than keep a clever path that never runs. The
+converse arrived first — after sdcard/deck.json was normalised (commit 92c238c) the splice never
+fails and never earns anything.
 
-That is only safe because of a coincidence worth stating plainly: `json.dumps(indent=2)`
-reproduces the existing themes and settings blocks *exactly*, character for character, because
-those blocks have no hand-formatting in them. That gives the splice something better than a
-parser — it knows the length of the text it is replacing because it can regenerate it and
-compare. If the regeneration does not match what is in the file, the assumption has broken and
-the splice refuses rather than guesses.
+So this writes `json.dumps(indent=2)` and keeps two guards that survived the change:
 
-There are then two independent checks before anything reaches the disk: the result must parse
-back to exactly the object we meant to write, and the tail must be unchanged. Failing either
-falls back to a full re-dump, which is uglier but never wrong. `SaveResult.spliced` says which
-happened, so if the fallback turns out to fire in normal use the honest response is to delete
-the splice rather than keep a clever path that never runs.
+  * **the reparse check** — the text must parse back to exactly the object we meant to write;
+  * **the scope guard**, which is the honest successor to the old "tail is unchanged" check.
+    That invariant was never really "pages are safe": it was *every top-level key this module
+    does not own is unchanged*, and it only happened to be expressible as a string compare
+    because the unowned part was a contiguous suffix. It is now asserted directly, and it says
+    something the string compare could not — that `nav`, or anything a future firmware adds,
+    comes through a save untouched no matter where in the file it sits.
+
+`SaveResult.reformatted` reports that the file was not already in canonical form, so a save that
+re-indents somebody's hand-formatting still says so once, loudly, before the diff surprises them.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# The two blocks this module owns, in the order they appear in the file. `rev` is handled
-# separately — it is a scalar on one line, not a block.
-BLOCKS = ("themes", "settings")
-
-# Top-level keys are the only ones written at exactly two spaces of indent; everything nested
-# is at four or more. That makes this anchor unambiguous without parsing.
-ANCHOR = '\n  "{key}": '
-
-# Scoped to the text before `themes` so it cannot reach a `rev` inside a page or an action.
-REV_RE = re.compile(r'("rev"\s*:\s*)(-?\d+)')
+# The top-level keys this module rewrites. Everything else in the file is carried through and
+# the scope guard proves it. `rev` is included because a save always bumps it.
+OWNED = ("rev", "themes", "settings", "pages")
 
 
 class WriteError(Exception):
@@ -52,89 +49,42 @@ class WriteError(Exception):
 class SaveResult:
     path: Path
     rev: int
-    spliced: bool
+    reformatted: bool
     text: str = ""
     backup: Path | None = None
 
     @property
     def warning(self) -> str | None:
-        if self.spliced:
+        if not self.reformatted:
             return None
         return (
-            "deck.json was reformatted — pages and buttons were re-indented rather than left "
-            "alone. Check `git diff sdcard/deck.json` before committing."
+            "deck.json was reformatted — hand-formatting elsewhere in the file was replaced "
+            "with standard indentation. Check `git diff sdcard/deck.json` before committing."
         )
 
 
-def render_block(value: Any, level: int = 1, indent: int = 2) -> str:
-    """Serialises one value the way json.dumps(indent=2) would render it in place.
+def canonical(data: dict[str, Any]) -> str:
+    """The one true rendering of a layout: two-space indent, LF, trailing newline.
 
-    json.dumps has no notion of "this object is nested two spaces in", so every line after the
-    first needs the parent's indent added back. Getting this wrong is not subtle — the splice
-    compares the result against the file and refuses on any mismatch.
+    Every other question in this module — is the file already in this shape, what will the diff
+    look like, does the result still mean what it meant — is answered against this function, so
+    there is exactly one place the format is decided.
     """
-    text = json.dumps(value, indent=indent)
-    pad = " " * (indent * level)
-    head, *rest = text.split("\n")
-    if not rest:
-        return head
-    return head + "\n" + "\n".join(pad + line for line in rest)
+    return json.dumps(data, indent=2) + "\n"
 
 
-def _find_block(text: str, key: str, current: Any) -> tuple[int, int]:
-    """Returns the character span of `key`'s value, or raises if it is not where we expect.
+def is_canonical(text: str) -> bool:
+    """Whether saving this file would reformat anything beyond the values that changed.
 
-    The end offset comes from regenerating the current value rather than from counting
-    brackets. A bracket counter has to understand strings and escapes to avoid stopping at a
-    `}` inside a label; regenerating has no such failure mode, and it doubles as the check that
-    the file is in the shape this module knows how to edit.
+    A file with mixed line endings is never canonical: it cannot be reproduced faithfully, so a
+    save normalises it and the caller is told.
     """
-    anchor = ANCHOR.format(key=key)
-    first = text.find(anchor)
-    if first < 0:
-        raise WriteError(f'no top-level "{key}" block')
-    if text.find(anchor, first + 1) >= 0:
-        raise WriteError(f'more than one top-level "{key}" block')
-
-    start = first + len(anchor)
-    rendered = render_block(current)
-    if text[start : start + len(rendered)] != rendered:
-        raise WriteError(f'the "{key}" block is not formatted the way json.dumps writes it')
-
-    return start, start + len(rendered)
-
-
-def splice(original: str, data: dict[str, Any], themes: list, settings: dict, rev: int) -> str:
-    """Returns `original` with rev, themes and settings replaced, or raises WriteError."""
-    spans = {key: _find_block(original, key, data[key]) for key in BLOCKS}
-
-    replacements = [
-        (spans["themes"], render_block(themes)),
-        (spans["settings"], render_block(settings)),
-    ]
-
-    # rev lives before both blocks, and is rewritten within that prefix only.
-    head_end = min(start for start, _ in spans.values())
-    head = original[:head_end]
-    new_head, count = REV_RE.subn(lambda m: f"{m.group(1)}{rev}", head, count=1)
-    if count != 1:
-        raise WriteError("no top-level rev to update")
-
-    # Right to left, so replacing a later span cannot move an earlier one.
-    text = original
-    for (start, end), rendered in sorted(replacements, key=lambda item: -item[0][0]):
-        text = text[:start] + rendered + text[end:]
-
-    return new_head + text[head_end:]
-
-
-def _expected(data: dict[str, Any], themes: list, settings: dict, rev: int) -> dict[str, Any]:
-    """The object the file must parse back to. Key order follows the file, not this dict."""
-    merged = dict(data)
-    merged["rev"] = rev
-    merged["themes"] = themes
-    merged["settings"] = settings
-    return merged
+    if newline_style(text) is None:
+        return False
+    try:
+        return _lf(text) == canonical(json.loads(text))
+    except json.JSONDecodeError:
+        return False
 
 
 def newline_style(original: str) -> str | None:
@@ -142,14 +92,13 @@ def newline_style(original: str) -> str | None:
 
     This file is edited on Windows and the checked-in copy has CRLF endings, which caught this
     module out during development in the exact way the module was written to prevent: the first
-    check of "does json.dumps reproduce these blocks" was run through `open()`, whose universal
+    check of "does json.dumps reproduce this file" was run through `open()`, whose universal
     newline translation quietly turned every CRLF into LF, and the answer came back yes for a
     file that does not actually look like that on disk.
 
-    So the splice runs entirely in LF space and the endings are put back at the end. A file
-    with mixed endings gets no conversion at all — there is no way to restore it faithfully,
-    and guessing would rewrite lines this module promises not to touch. The block comparison
-    then refuses and the full re-dump takes over.
+    So everything here runs in LF space and the endings are put back at the end. A file with
+    mixed endings gets no restoration — there is no faithful way to do it, and guessing would
+    rewrite lines at random. It is normalised to LF and reported as reformatted.
     """
     if "\r\n" not in original:
         return None if "\r" in original else "\n"
@@ -158,40 +107,79 @@ def newline_style(original: str) -> str | None:
     return "\r\n"
 
 
-def build(original: str, themes: list, settings: dict, rev: int) -> tuple[str, bool]:
-    """Produces the new file text and says whether the splice held.
+def _lf(text: str) -> str:
+    return text.replace("\r\n", "\n")
 
-    Separated from the disk write so the tests — and a dry run — can look at the text without
-    a temp directory.
+
+def _expected(
+    data: dict[str, Any], *, themes: list, settings: dict, pages: list, rev: int
+) -> dict[str, Any]:
+    """The object the file must parse back to. Key order follows the file, not this dict."""
+    merged = dict(data)
+    merged["rev"] = rev
+    merged["themes"] = themes
+    merged["settings"] = settings
+    merged["pages"] = pages
+    return merged
+
+
+def check_scope(before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Raises unless every top-level key outside OWNED came through untouched.
+
+    Order is checked as well as content, and across the whole top level rather than only the
+    unowned keys — comparing unowned keys to each other would not notice `nav` moving from after
+    `rev` to before it, since neither key is missing and the two remaining orders are both just
+    `["nav"]`. deck.json is read by people at least as often as by the firmware, and a writer
+    that quietly reshuffles the top of the file is one you have to diff every time to trust.
+
+    The one permitted difference is an owned key the file did not have, which is appended: a
+    deck.json with no `pages` at all gains one the first time a page is added.
+    """
+    expected_order = list(before) + [key for key in OWNED if key not in before]
+    if list(after) != expected_order:
+        added = sorted(set(after) - set(expected_order))
+        lost = sorted(set(expected_order) - set(after))
+        if added or lost:
+            raise WriteError(
+                "the save changed which top-level keys exist: "
+                + ", ".join(filter(None, [
+                    f"added {added}" if added else "",
+                    f"removed {lost}" if lost else "",
+                ]))
+            )
+        raise WriteError("the save reordered the top-level keys")
+
+    for key in before:
+        if key not in OWNED and before[key] != after[key]:
+            raise WriteError(f'the save changed "{key}", which this module does not own')
+
+
+def build(
+    original: str, *, themes: list, settings: dict, pages: list, rev: int
+) -> tuple[str, bool]:
+    """Produces the new file text and says whether anything beyond the values was reformatted.
+
+    Keyword-only on purpose: the argument list is this module's scope statement, and four
+    positional collections in a row is exactly the shape that gets silently transposed. Separated
+    from the disk write so the tests — and a dry run — can look at the text without a temp
+    directory.
     """
     newline = newline_style(original)
-    source = original.replace("\r\n", "\n") if newline == "\r\n" else original
+    data = json.loads(_lf(original))
 
-    data = json.loads(source)
-    expected = _expected(data, themes, settings, rev)
-    tail_anchor = ANCHOR.format(key="pages")
-    tail_at = source.find(tail_anchor)
+    expected = _expected(data, themes=themes, settings=settings, pages=pages, rev=rev)
+    text = canonical(expected)
 
-    try:
-        text = splice(source, data, themes, settings, rev)
+    written = json.loads(text)
+    if written != expected:
+        raise WriteError("the rendered file does not parse back to the intended layout")
+    check_scope(data, written)
 
-        # Two checks, deliberately independent. The first says the file means the right thing;
-        # the second says we did not disturb the part we promised not to touch. A splice that
-        # somehow rewrote pages into an equivalent-but-reformatted shape would pass the first
-        # and fail the second, which is exactly the failure this module exists to prevent.
-        if json.loads(text) != expected:
-            raise WriteError("the spliced file does not parse back to the intended layout")
-        if tail_at >= 0 and text[text.find(tail_anchor) :] != source[tail_at:]:
-            raise WriteError('the spliced file changed something after "pages"')
-
-        spliced = True
-    except (WriteError, json.JSONDecodeError):
-        text, spliced = json.dumps(expected, indent=2) + "\n", False
-
+    reformatted = not is_canonical(original)
     if newline == "\r\n":
         text = text.replace("\n", "\r\n")
 
-    return text, spliced
+    return text, reformatted
 
 
 def sweep_temp_files(directory: Path) -> None:
@@ -210,14 +198,20 @@ def sweep_temp_files(directory: Path) -> None:
 
 
 def write(
-    path: Path, themes: list, settings: dict, rev: int, *, backup_dir: Path | None = None
+    path: Path,
+    *,
+    themes: list,
+    settings: dict,
+    pages: list,
+    rev: int,
+    backup_dir: Path | None = None,
 ) -> SaveResult:
     # read_bytes().decode() rather than read_text(): the latter applies universal-newline
     # translation, so a file someone once saved from Notepad would come back LF-only and every
-    # line in it would show up in the diff of a one-colour change.
+    # line in it would show up in the diff of a one-value change.
     original = path.read_bytes().decode("utf-8")
 
-    text, spliced = build(original, themes, settings, rev)
+    text, reformatted = build(original, themes=themes, settings=settings, pages=pages, rev=rev)
     backup = _back_up(path, original, backup_dir)
 
     sweep_temp_files(path.parent)
@@ -225,7 +219,7 @@ def write(
     temp.write_bytes(text.encode("utf-8"))
     os.replace(temp, path)
 
-    return SaveResult(path=path, rev=rev, spliced=spliced, text=text, backup=backup)
+    return SaveResult(path=path, rev=rev, reformatted=reformatted, text=text, backup=backup)
 
 
 KEEP_BACKUPS = 20

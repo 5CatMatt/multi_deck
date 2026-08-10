@@ -26,7 +26,8 @@ from typing import Any
 from PIL import ImageTk
 
 from deckbuilder import budget, render, writer
-from deckbuilder.model import ModelError, ThemeDoc
+from deckbuilder.layout_panel import LayoutPanel
+from deckbuilder.model import DeckDoc, ModelError
 from deckbuilder.theme_form import (
     BASE_POINTS,
     DISPLAY_CHOICES,
@@ -59,10 +60,14 @@ def enable_dpi_awareness() -> None:
     """Opts into real pixels before Tk starts.
 
     Without this Windows renders the window at 96 DPI and bitmap-stretches it, which blurs the
-    preview — and blurring the preview defeats the point of having one. It also makes the app
-    behave the same run from source as it does packaged: PyInstaller's manifest marks the exe
-    DPI-aware, so without this call the two disagree about what a pixel is, and any layout
-    arithmetic that works in one is wrong in the other.
+    preview — and blurring the preview defeats the point of having one.
+
+    This call is the only thing that does it. An earlier version of this comment claimed
+    PyInstaller's manifest marks the exe DPI-aware, so that the call was really about making a
+    source run match a packaged one; that is not true. The manifest PyInstaller embeds carries
+    requestedExecutionLevel, the supportedOS list, longPathAware and a Common-Controls
+    dependency, and says nothing about DPI at all — checked by reading it out of the built exe.
+    Which means source and packaged runs already agree, and both of them need this.
 
     Fonts are then scaled back up from the display's DPI, so 12pt stays 12pt on the eye rather
     than becoming 12 device pixels.
@@ -116,12 +121,16 @@ def _safe_stem(stem: str) -> str:
 class BuilderApp:
     def __init__(self, root: tk.Tk, path: Path) -> None:
         self.root = root
-        self.doc = ThemeDoc.load(path)
+        self.doc = DeckDoc.load(path)
         self.index = 0
         self.photo: ImageTk.PhotoImage | None = None
         self._pending: str | None = None
         self._loading = False
         self._scroll_panes: list[tuple[tk.Canvas, int, ttk.Frame]] = []
+        self._problem_signature: tuple = ()
+        self._override = False
+        self._drag: dict[str, Any] | None = None
+        self.preview = render.Preview(image=None)  # replaced on the first draw
 
         writer.sweep_temp_files(path.parent)
 
@@ -203,6 +212,23 @@ class BuilderApp:
         style.configure("Mono.TLabel", font=("Consolas", points))
         self.root.option_add("*Font", ("Segoe UI", points))
 
+        # Treeview's rowheight does not follow its font — it defaults to 20px and stays there.
+        # At 12pt on a 150% display a line needs 32, so the rows overlap into an unreadable
+        # smear, and worse, ttk's hit-testing still uses 20: the row you click is not the row
+        # you are looking at. Measured rather than guessed, because this is recomputed every
+        # time the text-size menu changes the point size.
+        import tkinter.font as tkfont
+
+        line = tkfont.Font(font=("Segoe UI", points)).metrics("linespace")
+        style.configure("Treeview", rowheight=line + 6)
+
+        self.points = points
+        # Column widths belong to the widget rather than the style, so the tree cannot pick
+        # them up from here on its own.
+        panel = getattr(self, "layout_panel", None)
+        if panel is not None:
+            panel.restyle(points)
+
     def _menu(self) -> None:
         bar = tk.Menu(self.root)
 
@@ -224,7 +250,7 @@ class BuilderApp:
         view = tk.Menu(bar, tearoff=0)
         size = tk.Menu(view, tearoff=0)
         for points in (11, 12, 13, 14, 16, 18):
-            size.add_command(label=f"{points} pt", command=lambda p=points: self._style(p))
+            size.add_command(label=f"{points} pt", command=lambda p=points: self._set_text_size(p))
         view.add_cascade(label="Text size", menu=size)
         bar.add_cascade(label="View", menu=view)
 
@@ -233,6 +259,7 @@ class BuilderApp:
         self.root.bind_all("<Control-o>", lambda _e: self.open_file())
         self.root.bind_all("<Control-z>", lambda _e: self.undo())
         self.root.bind_all("<Control-y>", lambda _e: self.redo())
+        self.root.bind_all("<MouseWheel>", self._wheel)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
     def _layout(self) -> None:
@@ -283,13 +310,42 @@ class BuilderApp:
 
         bar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: canvas.yview_scroll(-e.delta // 120, "units"),
-            add="+",
-        )
         self._scroll_panes.append((canvas, window, inner))
         return inner
+
+    def _set_text_size(self, points: int) -> None:
+        """Bigger type needs a bigger window, or the controls just move further off the edge.
+
+        Re-fitting is the whole point of the menu: every widget sizes itself from the font, so
+        the column that fitted at 11pt does not at 18, and the window has to be told.
+        """
+        self._style(points)
+        self._size_window()
+
+    def _wheel(self, event) -> None:
+        """Scrolls whatever the pointer is actually over.
+
+        Each pane used to install its own `bind_all("<MouseWheel>")`, which meant every pane
+        scrolled on every wheel turn — invisible while only one tab was ever open, and no longer
+        true now that a tab contains a Treeview with its own scrolling. Enter/Leave is the usual
+        fix and does not work here: moving the pointer from a canvas onto a widget inside it
+        generates a Leave on the canvas, so the binding would come and go constantly.
+
+        So there is one binding, and it walks up from the widget under the pointer to find the
+        first thing that scrolls.
+        """
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        panes = {canvas: canvas for canvas, _w, _i in self._scroll_panes}
+        lines = -event.delta // 120
+
+        while widget is not None:
+            if isinstance(widget, ttk.Treeview):
+                widget.yview_scroll(lines, "units")
+                return
+            if widget in panes:
+                widget.yview_scroll(lines, "units")
+                return
+            widget = getattr(widget, "master", None)
 
     def _fit_left(self, cap: int) -> int:
         """Widens the controls column to whatever the widest row actually needs."""
@@ -311,11 +367,18 @@ class BuilderApp:
         notebook.pack(fill="both", expand=True)
 
         themes = ttk.Frame(notebook, padding=8)
+        layout = ttk.Frame(notebook, padding=8)
         settings = ttk.Frame(notebook, padding=8)
         notebook.add(themes, text="  Themes  ")
+        notebook.add(layout, text="  Layout  ")
         notebook.add(settings, text="  Settings  ")
 
         self._build_theme_tab(themes)
+        # Scrollable, like the theme form and for the same reason: a tree, four rows of
+        # commands and an action editor do not fit in one column, and at the larger text sizes
+        # this tool exists to be read at, they do not come close. Without it the action editor
+        # sits below the fold with no way to reach it.
+        self.layout_panel = LayoutPanel(self._scrollable(layout), self)
         self._build_settings_tab(settings)
 
     def _build_theme_tab(self, parent: ttk.Frame) -> None:
@@ -448,6 +511,14 @@ class BuilderApp:
                                 highlightthickness=0, background="#000000")
         self.canvas.pack()
 
+        # Selection and drag feedback are canvas items drawn over the Pillow image rather than
+        # baked into it. That keeps render.py a pure transcription of the firmware — it has no
+        # notion of "selected", because the deck has none — and means clicking a tile does not
+        # cost a re-render of an 800x480 composite.
+        self.canvas.bind("<Button-1>", self._canvas_press)
+        self.canvas.bind("<B1-Motion>", self._canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
+
         self.caption = ttk.Label(parent, foreground="#8b949e", justify="left")
         self.caption.pack(anchor="w", pady=(6, 0))
 
@@ -486,10 +557,10 @@ class BuilderApp:
     # -- data plumbing ------------------------------------------------------------------
 
     def _page_titles(self) -> list[str]:
-        return [p.get("title") or p.get("id") or "?" for p in self.doc.raw.get("pages", [])]
+        return [p.get("title") or p.get("id") or "?" for p in self.doc.pages]
 
     def _page_id(self) -> str | None:
-        pages = self.doc.raw.get("pages", [])
+        pages = self.doc.pages
         titles = self._page_titles()
         if self.page_var.get() in titles:
             return pages[titles.index(self.page_var.get())].get("id")
@@ -497,6 +568,23 @@ class BuilderApp:
 
     def _theme_choices(self) -> tuple[tuple[str, Any], ...]:
         return tuple((name, name) for name in self.doc.theme_names())
+
+    # -- what the layout panel needs from the window -------------------------------------
+
+    def library_dir(self) -> Path:
+        """Where a park/import dialog opens.
+
+        There is no fixed library home — that was decided deliberately, so a theme can live in
+        Dropbox or beside a project — which makes "wherever you were last" the only sensible
+        starting point. Falls back to the deck's own folder rather than to nothing.
+        """
+        return last_library() or self.doc.path.parent
+
+    def remember_library(self, folder: Path) -> None:
+        remember_library(folder)
+
+    def app_backups(self) -> Path:
+        return app_dir() / "backups"
 
     def _wallpaper_choices(self) -> tuple[tuple[str, Any], ...]:
         options: list[tuple[str, Any]] = [("None (flat background)", "")]
@@ -573,9 +661,12 @@ class BuilderApp:
         self._draw_meter()
         self._draw_problems()
         self._refresh_list()
+        self.layout_panel.refresh()
         self.page_box.configure(values=self._page_titles())
-        if not self.page_var.get():
-            titles = self._page_titles()
+        titles = self._page_titles()
+        if self.page_var.get() not in titles:
+            # A page can now be renamed, parked or deleted out from under the combobox, and a
+            # stale selection there renders pages[0] while claiming to be showing something else.
             self.page_var.set(titles[0] if titles else "")
 
     def _draw_preview(self) -> None:
@@ -597,10 +688,160 @@ class BuilderApp:
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
 
+        self.preview = preview
+        self._draw_selection()
+
         caption = preview.font_name
         if preview.warnings:
             caption += "\n" + "  •  ".join(preview.warnings)
         self.caption.configure(text=caption)
+
+    # -- the canvas as a layout tool -----------------------------------------------------
+
+    def _draw_selection(self) -> None:
+        """Outlines the selected tile, and ghosts anything the firmware would not draw."""
+        self.canvas.delete("overlay")
+        zoom = self.zoom.get()
+
+        for button_id in self.preview.skipped:
+            # Not in `boxes`, because it is not on the panel. Drawn at the edge as a hollow
+            # marker so a tile the deck silently drops is visible here rather than merely absent
+            # — "it disappeared" is the hardest version of this bug to diagnose.
+            self.canvas.create_text(
+                render.SCREEN_W * zoom - 8, render.SCREEN_H * zoom - 8,
+                text=f"off-grid: {button_id}", anchor="se", fill="#e5534b", tags="overlay",
+            )
+
+        selected = self._selected_button_id()
+        box = self.preview.boxes.get(selected) if selected else None
+        if box is None:
+            return
+
+        x0, y0, x1, y1 = (round(v * zoom) for v in box)
+        self.canvas.create_rectangle(
+            x0, y0, x1 - 1, y1 - 1, outline="#4aa3ff", width=2, tags="overlay"
+        )
+
+    def _selected_button_id(self) -> str | None:
+        picked = self.layout_panel.selection()
+        if picked is None or picked[0] != "button":
+            return None
+        _kind, page_index, index = picked
+        if self.doc.pages[page_index].get("id") != self._page_id():
+            return None
+        try:
+            return self.doc.pages[page_index]["buttons"][index].get("id")
+        except (IndexError, KeyError):
+            return None
+
+    def _at(self, event) -> tuple[int, int]:
+        """Canvas coordinates in the preview's own pixels, undoing the zoom."""
+        zoom = self.zoom.get() or 1.0
+        return round(self.canvas.canvasx(event.x) / zoom), round(
+            self.canvas.canvasy(event.y) / zoom
+        )
+
+    def _canvas_press(self, event) -> None:
+        x, y = self._at(event)
+        button_id = self.preview.at(x, y)
+        self._drag = None
+        if button_id is None:
+            return
+
+        located = self._locate(button_id)
+        if located is None:
+            return
+        page_index, index = located
+        self._drag = {"id": button_id, "page": page_index, "index": index, "from": (x, y)}
+        self.layout_panel.select_button(page_index, index)
+
+    def _canvas_drag(self, event) -> None:
+        if not self._drag:
+            return
+        x, y = self._at(event)
+        zoom = self.zoom.get()
+
+        self.canvas.delete("drag")
+        cols_rows = self.preview.cell
+        if cols_rows is None:
+            return
+
+        cell = render.cell_at(x, y, *cols_rows)
+        if cell is None:
+            return
+
+        cell_w, cell_h = render._cells(*cols_rows)
+        box = render._tile_box(cell[0], cell[1], 1, 1, cell_w, cell_h)
+        x0, y0, x1, y1 = (round(v * zoom) for v in box)
+        self.canvas.create_rectangle(
+            x0, y0, x1 - 1, y1 - 1, outline="#3fb950", width=2, dash=(4, 3), tags="drag"
+        )
+
+    def _canvas_release(self, event) -> None:
+        drag = self._drag
+        self._drag = None
+        self.canvas.delete("drag")
+        if not drag:
+            return
+
+        x, y = self._at(event)
+        if self.preview.cell is None:
+            return
+        cell = render.cell_at(x, y, *self.preview.cell)
+        if cell is None:
+            return  # a gutter, the nav bar, or the margin — no guessing at the nearer side
+
+        page_index, index = drag["page"], drag["index"]
+        if (x, y) == drag["from"]:
+            return  # a click, not a drag
+
+        if self.doc.is_pinned(page_index):
+            self._drop_pinned(page_index, index, cell)
+        else:
+            self._drop_auto(page_index, index, cell)
+
+    def _drop_pinned(self, page_index: int, index: int, cell: tuple[int, int]) -> None:
+        """Fixed page: the drop writes col/row, which is what Fixed is for."""
+        button = self.doc.pages[page_index]["buttons"][index]
+        if (button.get("pos") or {}).get("col") == cell[0] and \
+                (button.get("pos") or {}).get("row") == cell[1]:
+            return
+
+        self.doc.snapshot()
+        pos = dict(button.get("pos") or {"w": 1, "h": 1})
+        pos["col"], pos["row"] = cell
+        button["pos"] = {key: pos.get(key, 1) for key in ("col", "row", "w", "h")}
+        self._say(
+            f"Moved {button.get('id')} to column {cell[0]}, row {cell[1]}. "
+            "Overlaps are listed below rather than prevented — two tiles in one cell is legal "
+            "on the device, and the top one simply wins.",
+            "ok",
+        )
+        self.refresh(immediate=True)
+
+    def _drop_auto(self, page_index: int, index: int, cell: tuple[int, int]) -> None:
+        """Auto page: the drop reorders the array, which costs nothing on the wire."""
+        cols = (self.preview.cell or (4, 3))[0]
+        target = min(cell[1] * cols + cell[0], len(self.doc.pages[page_index]["buttons"]) - 1)
+        if target == index:
+            return
+
+        self.doc.snapshot()
+        new_index = self.doc.move_button(page_index, index, target - index)
+        self.layout_panel.select_button(page_index, new_index)
+        self._say(
+            "Reordered. On an Auto page the order in the file is the layout, so this costs "
+            "nothing — switch the page to Fixed if you want spans or deliberate gaps.",
+            "ok",
+        )
+        self.refresh(immediate=True)
+
+    def _locate(self, button_id: str) -> tuple[int, int] | None:
+        for page_index, page in enumerate(self.doc.pages):
+            for index, button in enumerate(page.get("buttons") or []):
+                if button.get("id") == button_id:
+                    return page_index, index
+        return None
 
     def _draw_meter(self) -> None:
         report = budget.report(self.doc.next_rev(), self.doc.candidate_raw())
@@ -616,16 +857,39 @@ class BuilderApp:
         self.meter_detail.configure(text=report.detail())
 
     def _draw_problems(self) -> None:
-        problems = self.doc.shape_problems() + self.doc.problems()
+        shape = self.doc.shape_problems()
+        problems = self.doc.problems()
+        notices = self.doc.notices()
+
+        lines = [f"• {p}" for p in shape + problems] + [f"– {n}" for n in notices]
         self.problems.configure(state="normal")
         self.problems.delete("1.0", "end")
-        self.problems.insert("1.0", "\n".join(f"• {p}" for p in problems)
-                             if problems else "Nothing wrong with this layout.")
+        self.problems.insert("1.0", "\n".join(lines) if lines
+                             else "Nothing wrong with this layout.")
         self.problems.configure(state="disabled")
-        self.save_button.configure(state="normal" if self._can_save(problems) else "disabled")
 
-    def _can_save(self, problems: list[str]) -> bool:
-        if self.doc.shape_problems():
+        # Arming the override is per problem list, not per session: fix one thing and the next
+        # Save asks again, rather than quietly carrying permission over to a different mistake.
+        signature = (tuple(shape), tuple(problems))
+        if signature != self._problem_signature:
+            self._problem_signature = signature
+            self._override = False
+
+        self.save_button.configure(state="normal" if self._can_save(shape) else "disabled")
+
+    def _can_save(self, shape_problems: list[str]) -> bool:
+        """Whether Save is even offered — the two things clicking again cannot fix.
+
+        Deliberately *not* fed the validator's list. That list is offered with an override,
+        because the person editing may know something the validator does not and the file is
+        theirs. These two are different: a drifted key set would be written by the dump exactly
+        as handed to it, and an over-limit frame is discarded by the deck in silence. Neither
+        has a "yes I meant it" that produces a working deck.
+
+        The earlier version of this method took the validator's list as an argument and then
+        ignored it, which read as though the check existed.
+        """
+        if shape_problems:
             return False
         return not budget.report(self.doc.next_rev(), self.doc.candidate_raw()).over_limit
 
@@ -735,20 +999,47 @@ class BuilderApp:
             self._say(f"Refusing to write: {report.summary()}. {report.detail()}", "error")
             return
 
+        # The agent refuses a layout with problems and exits, and it starts at logon — so this
+        # is not a warning about the deck looking wrong, it is a warning about the deck stopping
+        # working until someone opens a log. Overridable, because the person editing may be
+        # about to add the page the dangling reference points at, and it is their file.
+        problems = self.doc.problems()
+        if problems and not self._override:
+            self._override = True
+            more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+            self._say(
+                f"Refusing to write: {problems[0]}{more}"
+                "\n\nClick Save again to write it anyway. The agent refuses a layout with "
+                "problems, so it will not start at logon and the deck keeps the layout it "
+                "already has.",
+                "error",
+            )
+            return
+
         try:
             result = writer.write(
-                self.doc.path, self.doc.themes, self.doc.settings, rev,
+                self.doc.path,
+                themes=self.doc.themes,
+                settings=self.doc.settings,
+                pages=self.doc.pages,
+                rev=rev,
                 backup_dir=app_dir() / "backups",
             )
         except OSError as exc:
             self._say(f"Could not write {self.doc.path}: {exc}", "error")
+            return
+        except writer.WriteError as exc:
+            # The scope guard or the reparse check fired, which means this build has a bug
+            # rather than the file having a problem. Nothing was written; say so plainly so the
+            # message is not mistaken for "fix your layout".
+            self._say(f"Refusing to write — the writer caught itself: {exc}", "error")
             return
 
         self.doc.mark_saved(result.text, result.rev)
 
         message = f"Saved as rev {result.rev}. Right-click the tray icon → Reload deck.json."
         level = "ok"
-        if not result.spliced:
+        if result.reformatted:
             message += "\n\n" + (result.warning or "")
             level = "warn"
         if report.over_warning:
@@ -762,7 +1053,7 @@ class BuilderApp:
             "Revert", "Discard unsaved changes?", parent=self.root
         ):
             return
-        self.doc = ThemeDoc.load(self.doc.path)
+        self.doc = DeckDoc.load(self.doc.path)
         render.clear_asset_cache()
         self._load_theme(self.index)
         self.refresh(immediate=True)
@@ -776,7 +1067,7 @@ class BuilderApp:
         if not chosen:
             return
         try:
-            self.doc = ThemeDoc.load(Path(chosen))
+            self.doc = DeckDoc.load(Path(chosen))
         except (OSError, ValueError) as exc:
             messagebox.showerror("Open failed", str(exc), parent=self.root)
             return
@@ -808,12 +1099,34 @@ def _settings_file() -> Path:
     return app_dir() / "builder.json"
 
 
-def remember(path: Path) -> None:
+def _stored() -> dict:
+    try:
+        data = json.loads(_settings_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _store(**values) -> None:
     try:
         _settings_file().parent.mkdir(parents=True, exist_ok=True)
-        _settings_file().write_text(json.dumps({"deck": str(path)}), encoding="utf-8")
+        _settings_file().write_text(json.dumps({**_stored(), **values}), encoding="utf-8")
     except OSError:
         pass
+
+
+def remember(path: Path) -> None:
+    _store(deck=str(path))
+
+
+def remember_library(folder: Path) -> None:
+    """Kept separately from the deck path, and separately on purpose.
+
+    Library files live wherever you want them — that was the decision — so the folder you park
+    into has nothing to do with where deck.json is. Storing one key for both means the dialog
+    opens in the wrong place every other time you use it.
+    """
+    _store(library=str(folder))
 
 
 def last_used() -> Path | None:
@@ -822,11 +1135,13 @@ def last_used() -> Path | None:
     A packaged exe has no idea where the repo is, so the alternative to remembering is a file
     dialog on every launch.
     """
-    try:
-        stored = json.loads(_settings_file().read_text(encoding="utf-8")).get("deck")
-    except (OSError, ValueError):
-        return None
+    stored = _stored().get("deck")
     return Path(stored) if stored and Path(stored).exists() else None
+
+
+def last_library() -> Path | None:
+    stored = _stored().get("library")
+    return Path(stored) if stored and Path(stored).is_dir() else None
 
 
 def resolve(explicit: Path | None) -> Path | None:
