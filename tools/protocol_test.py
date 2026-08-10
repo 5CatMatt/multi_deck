@@ -2899,6 +2899,105 @@ class ButtonFormTests(unittest.TestCase):
         )
 
 
+class WindowTests(unittest.TestCase):
+    """The two things that only go wrong once a real event loop is running.
+
+    Every other test in this file drives the editor's objects directly, which is fast and covers
+    the logic — and is exactly why both of these shipped. One needs Tk to deliver a queued
+    virtual event; the other needs a font to be measured.
+    """
+
+    def setUp(self):
+        try:
+            import tkinter as tk
+
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("tkinter or Pillow not installed")
+
+        try:
+            self.root = tk.Tk()
+        except tk.TclError:
+            self.skipTest("no display")
+
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+
+        import shutil
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        self.deck = Path(tmp) / "sdcard"
+        shutil.copytree(REPO / "sdcard", self.deck)
+
+    def _app(self):
+        from deckbuilder.app import BuilderApp
+
+        return BuilderApp(self.root, self.deck / "deck.json")
+
+    def test_rows_are_tall_enough_for_the_text_in_them(self):
+        """ttk's rowheight does not follow its font: it defaults to 20 and stays there.
+
+        At any readable point size that clips the text into a smear. It is also the whole of the
+        hit-testing bug that came with it — ttk lays rows out *and* identifies them from
+        rowheight, so while the two disagreed, the row you clicked was not the row you could see.
+        Asserted here rather than by clicking, because a click needs a mapped window and a test
+        suite that flashes windows is one you stop running.
+        """
+        import tkinter.font as tkfont
+        from tkinter import ttk
+
+        app = self._app()
+        style = ttk.Style()
+
+        for points in (11, 12, 14, 18):
+            with self.subTest(points=points):
+                app._style(points)
+                line = tkfont.Font(font=("Segoe UI", points)).metrics("linespace")
+                self.assertGreaterEqual(int(style.lookup("Treeview", "rowheight")), line)
+
+    def test_selecting_a_row_settles_instead_of_refreshing_forever(self):
+        """<<TreeviewSelect>> arrives queued, not only synchronously.
+
+        Rebuilding the tree restores the selection, which fires the event *after* the rebuild
+        has returned — so a flag cleared at the end of the rebuild does not stop it, and the
+        result is an endless refresh loop with a stack eight frames deep. It pins the CPU rather
+        than raising, and looks like a crash from the outside.
+        """
+        app = self._app()
+        panel = app.layout_panel
+
+        calls = []
+        original = app.refresh
+        app.refresh = lambda **kw: (calls.append(1), original(**kw))[1]
+
+        panel.tree.selection_set("button:0:1")
+        panel.tree.focus("button:0:1")
+
+        # Each update() drains the queue once. A live loop re-arms it every time, so the count
+        # keeps climbing; a settled one stops. Bounded either way, so the test cannot hang.
+        for _ in range(6):
+            self.root.update()
+        settled = len(calls)
+        for _ in range(6):
+            self.root.update()
+
+        self.assertEqual(len(calls), settled, "selecting a row keeps re-refreshing the window")
+        self.assertLess(settled, 4, f"one selection caused {settled} refreshes")
+
+    def test_a_selection_reaches_the_panels_that_follow_it(self):
+        app = self._app()
+        panel = app.layout_panel
+
+        panel.select_button(0, 3)
+        self.root.update()
+
+        self.assertEqual(panel.selection(), ("button", 0, 3))
+        self.assertIs(panel.button_form.button, app.doc.pages[0]["buttons"][3])
+        self.assertEqual(app.page_var.get(), app.doc.pages[0]["title"])
+
+
 class PageOperationTests(unittest.TestCase):
     """Pages and buttons are references as much as objects, so editing one edits the others."""
 

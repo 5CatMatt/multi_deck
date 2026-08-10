@@ -36,23 +36,50 @@ class LayoutPanel:
     def __init__(self, parent: ttk.Frame, app) -> None:
         self.app = app
 
-        # Rebuilding the tree restores the selection, and restoring a selection fires
+        # Rebuilding the tree restores the selection, restoring a selection fires
         # <<TreeviewSelect>>, and that handler refreshes the window, which rebuilds the tree.
-        # Nothing about that loop terminates. The guard is here rather than in the handler
-        # because the handler is also the legitimate entry point when a person clicks a row.
+        # Nothing about that loop terminates, and it needs two guards because the event arrives
+        # by two different routes:
+        #
+        #   _settling      — Tk can deliver the virtual event synchronously inside selection_set,
+        #                    which would re-enter a rebuild that is halfway through.
+        #   _last_selection — and it can also *queue* it, delivered once the rebuild has returned
+        #                    and _settling is back to False. That is the one that actually bit:
+        #                    an endless refresh loop with a stack only eight frames deep, so it
+        #                    pins the CPU rather than raising RecursionError, and no test that
+        #                    skips the event loop can see it.
+        #
+        # The second is the honest statement of what the handler is for: a person choosing a
+        # *different* row. Re-selecting what is already selected is a no-op.
         self._settling = False
+        self._last_selection: tuple | None = None
+        self._built = False
 
+        # A deck of five pages is thirty rows once the buttons are showing, and at a readable
+        # row height only a handful fit — so the scrollbar is not optional furniture.
+        holder = ttk.Frame(parent)
+        holder.pack(fill="x")
+
+        # Everything here packs with fill="x" and no vertical expand: this panel lives inside a
+        # scrolling frame, which has no vertical slack to hand out — a widget asking to expand
+        # into it gets nothing and quietly collapses.
         self.tree = ttk.Treeview(
-            parent, columns=("kind", "bytes"), show="tree headings", height=12,
+            holder, columns=("kind", "bytes"), show="tree headings", height=10,
             selectmode="browse",
         )
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+
         self.tree.heading("#0", text="Page / button")
         self.tree.heading("kind", text="Type")
         self.tree.heading("bytes", text="Bytes")
         self.tree.column("#0", width=250, stretch=True)
-        self.tree.column("kind", width=90, stretch=False, anchor="w")
-        self.tree.column("bytes", width=70, stretch=False, anchor="e")
-        self.tree.pack(fill="both", expand=True)
+        self.tree.column("kind", stretch=False, anchor="w")
+        self.tree.column("bytes", stretch=False, anchor="e")
+        self.restyle(app.points)
+
+        scroll.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="x", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._selected())
 
         self.summary = ttk.Label(parent, foreground="#8b949e", justify="left")
@@ -61,10 +88,23 @@ class LayoutPanel:
         self._build_buttons(parent)
 
         editor = ttk.Frame(parent)
-        editor.pack(fill="both", expand=True, pady=(10, 0))
+        editor.pack(fill="x", pady=(10, 0))
         self.button_form = ButtonForm(editor, app)
 
     # -- chrome --------------------------------------------------------------------------
+
+    def restyle(self, points: int) -> None:
+        """Sizes the fixed columns to the text that goes in them.
+
+        Column widths are a property of the widget, not of the style, so they do not follow the
+        text-size menu on their own — and at 18pt a 90px Type column shows "launc". Measured from
+        the widest value each column can hold rather than padded by eye.
+        """
+        import tkinter.font as tkfont
+
+        font = tkfont.Font(font=("Segoe UI", points))
+        self.tree.column("kind", width=font.measure("hid_text") + 20)
+        self.tree.column("bytes", width=font.measure("8,888") + 20)
 
     def _build_buttons(self, parent: ttk.Frame) -> None:
         rows = ttk.Frame(parent)
@@ -135,8 +175,9 @@ class LayoutPanel:
         if self._settling:
             return
         picked = self.selection()
-        if picked is None:
+        if picked is None or picked == self._last_selection:
             return
+        self._last_selection = picked
         _kind, page_index, _button = picked
 
         # Selecting anything follows the preview to that page, because the alternative is two
@@ -175,6 +216,12 @@ class LayoutPanel:
         remembered = self.tree.focus()
         open_pages = {row for row in self.tree.get_children("") if self.tree.item(row, "open")}
 
+        # "Nothing is open" and "this is the first build" are different states, and conflating
+        # them meant collapsing every page and then touching anything sprang them all open
+        # again — the panel arguing with you about the view you just chose.
+        expand_all = not self._built
+        self._built = True
+
         self.tree.delete(*self.tree.get_children(""))
 
         total_buttons = 0
@@ -185,7 +232,7 @@ class LayoutPanel:
             self.tree.insert(
                 "", "end", iid=key, text=f"{title}   ({page.get('id')})",
                 values=(page.get("type") or "grid", f"{cost:,}"),
-                open=(key in open_pages) or not open_pages,
+                open=expand_all or key in open_pages,
             )
 
             for index, button in enumerate(page.get("buttons") or []):
@@ -669,6 +716,9 @@ class LayoutPanel:
             self.tree.see(key)
             self.tree.focus(key)
             self.tree.selection_set(key)
+            # Claimed before the queued <<TreeviewSelect>> arrives, so the handler sees the work
+            # as already done rather than doing it again and refreshing on top of the caller.
+            self._last_selection = self.selection()
         finally:
             self._settling = False
 

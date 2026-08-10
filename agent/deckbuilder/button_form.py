@@ -67,7 +67,7 @@ class ButtonForm:
         self._muted = True
 
         self.frame = ttk.Frame(parent)
-        self.frame.pack(fill="both", expand=True)
+        self.frame.pack(fill="x")
 
         head = ttk.Frame(self.frame)
         head.pack(fill="x")
@@ -94,7 +94,7 @@ class ButtonForm:
         # -- the action ------------------------------------------------------------------
 
         action = ttk.Labelframe(self.frame, text=" Action ", padding=6)
-        action.pack(fill="both", expand=True, pady=(8, 0))
+        action.pack(fill="x", pady=(8, 0))
         action.columnconfigure(1, weight=1)
 
         self.slot_var = tk.StringVar(value="Press")

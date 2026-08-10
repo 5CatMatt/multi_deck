@@ -208,6 +208,23 @@ class BuilderApp:
         style.configure("Mono.TLabel", font=("Consolas", points))
         self.root.option_add("*Font", ("Segoe UI", points))
 
+        # Treeview's rowheight does not follow its font — it defaults to 20px and stays there.
+        # At 12pt on a 150% display a line needs 32, so the rows overlap into an unreadable
+        # smear, and worse, ttk's hit-testing still uses 20: the row you click is not the row
+        # you are looking at. Measured rather than guessed, because this is recomputed every
+        # time the text-size menu changes the point size.
+        import tkinter.font as tkfont
+
+        line = tkfont.Font(font=("Segoe UI", points)).metrics("linespace")
+        style.configure("Treeview", rowheight=line + 6)
+
+        self.points = points
+        # Column widths belong to the widget rather than the style, so the tree cannot pick
+        # them up from here on its own.
+        panel = getattr(self, "layout_panel", None)
+        if panel is not None:
+            panel.restyle(points)
+
     def _menu(self) -> None:
         bar = tk.Menu(self.root)
 
@@ -229,7 +246,7 @@ class BuilderApp:
         view = tk.Menu(bar, tearoff=0)
         size = tk.Menu(view, tearoff=0)
         for points in (11, 12, 13, 14, 16, 18):
-            size.add_command(label=f"{points} pt", command=lambda p=points: self._style(p))
+            size.add_command(label=f"{points} pt", command=lambda p=points: self._set_text_size(p))
         view.add_cascade(label="Text size", menu=size)
         bar.add_cascade(label="View", menu=view)
 
@@ -238,6 +255,7 @@ class BuilderApp:
         self.root.bind_all("<Control-o>", lambda _e: self.open_file())
         self.root.bind_all("<Control-z>", lambda _e: self.undo())
         self.root.bind_all("<Control-y>", lambda _e: self.redo())
+        self.root.bind_all("<MouseWheel>", self._wheel)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
     def _layout(self) -> None:
@@ -288,13 +306,42 @@ class BuilderApp:
 
         bar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: canvas.yview_scroll(-e.delta // 120, "units"),
-            add="+",
-        )
         self._scroll_panes.append((canvas, window, inner))
         return inner
+
+    def _set_text_size(self, points: int) -> None:
+        """Bigger type needs a bigger window, or the controls just move further off the edge.
+
+        Re-fitting is the whole point of the menu: every widget sizes itself from the font, so
+        the column that fitted at 11pt does not at 18, and the window has to be told.
+        """
+        self._style(points)
+        self._size_window()
+
+    def _wheel(self, event) -> None:
+        """Scrolls whatever the pointer is actually over.
+
+        Each pane used to install its own `bind_all("<MouseWheel>")`, which meant every pane
+        scrolled on every wheel turn — invisible while only one tab was ever open, and no longer
+        true now that a tab contains a Treeview with its own scrolling. Enter/Leave is the usual
+        fix and does not work here: moving the pointer from a canvas onto a widget inside it
+        generates a Leave on the canvas, so the binding would come and go constantly.
+
+        So there is one binding, and it walks up from the widget under the pointer to find the
+        first thing that scrolls.
+        """
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        panes = {canvas: canvas for canvas, _w, _i in self._scroll_panes}
+        lines = -event.delta // 120
+
+        while widget is not None:
+            if isinstance(widget, ttk.Treeview):
+                widget.yview_scroll(lines, "units")
+                return
+            if widget in panes:
+                widget.yview_scroll(lines, "units")
+                return
+            widget = getattr(widget, "master", None)
 
     def _fit_left(self, cap: int) -> int:
         """Widens the controls column to whatever the widest row actually needs."""
@@ -323,7 +370,11 @@ class BuilderApp:
         notebook.add(settings, text="  Settings  ")
 
         self._build_theme_tab(themes)
-        self.layout_panel = LayoutPanel(layout, self)
+        # Scrollable, like the theme form and for the same reason: a tree, four rows of
+        # commands and an action editor do not fit in one column, and at the larger text sizes
+        # this tool exists to be read at, they do not come close. Without it the action editor
+        # sits below the fold with no way to reach it.
+        self.layout_panel = LayoutPanel(self._scrollable(layout), self)
         self._build_settings_tab(settings)
 
     def _build_theme_tab(self, parent: ttk.Frame) -> None:
